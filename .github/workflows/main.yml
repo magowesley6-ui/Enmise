@@ -1,15 +1,15 @@
 
-name: ExtNoBrasil PC Gamer - Linux Mint macOS
+name: ExtNoBrasil PC Gamer - Mint XFCE
 
 on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "Senha VNC de 6 a 8 caracteres"
+        description: "Senha VNC de 6 a 8 letras ou numeros"
         required: true
         type: string
       boot_mode:
-        description: "Primeira vez: installer. Depois de instalar: disk."
+        description: "Primeira vez installer; depois disk"
         required: true
         type: choice
         default: installer
@@ -22,183 +22,130 @@ permissions:
 
 jobs:
   virtual-pc:
-    name: Linux Mint Virtual PC
+    name: ExtNoBrasil PC Virtual
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Preparar dependencias
+      - name: Instalar dependencias
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            novnc \
-            websockify \
-            socat \
-            curl \
-            wget \
-            git \
-            ca-certificates
-          sudo install -d -m 755 /opt/extnobrasil
+            qemu-system-x86 qemu-utils novnc websockify \
+            socat curl wget ca-certificates
+
           mkdir -p "$HOME/virtual-pc"
 
       - name: Restaurar disco virtual
-        id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/virtual-pc/mint.qcow2
-          key: mint-pc-${{ runner.os }}-${{ github.repository }}-${{ github.run_id }}
+          key: mint-xfce-${{ github.repository }}-${{ github.run_id }}
           restore-keys: |
-            mint-pc-${{ runner.os }}-${{ github.repository }}-
+            mint-xfce-${{ github.repository }}-
 
-      - name: Preparar disco e ISO do Mint
+      - name: Baixar Linux Mint XFCE
         shell: bash
         run: |
           set -Eeuo pipefail
+          DIR="$HOME/virtual-pc"
+          DISK="$DIR/mint.qcow2"
+          ISO="$DIR/linuxmint.iso"
 
-          DISK="$HOME/virtual-pc/mint.qcow2"
-          ISO="$HOME/virtual-pc/linuxmint.iso"
-
-          if [ ! -f "$DISK" ]; then
+          # Confere se o disco restaurado e valido.
+          if [ -f "$DISK" ]; then
+            qemu-img check "$DISK"
+          else
             qemu-img create -f qcow2 "$DISK" 145G
           fi
 
+          # XFCE e mais leve que Cinnamon, mas a ISO precisa existir.
           if [ ! -s "$ISO" ]; then
-            wget -O "$ISO" \
-              "https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-cinnamon-64bit.iso"
+            URL="https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-xfce-64bit.iso"
+
+            if ! wget -O "$ISO" "$URL"; then
+              rm -f "$ISO"
+              echo "Falha ao baixar a ISO XFCE."
+              echo "Confira a versao e o endereco oficial do Linux Mint."
+              exit 1
+            fi
           fi
 
+          test -s "$ISO"
           qemu-img info "$DISK"
           ls -lh "$ISO"
 
-      - name: Criar instalador visual macOS
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cat > /tmp/mint-macos-setup.sh <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -e
-
-          sudo apt-get update
-          sudo apt-get install -y git plank
-
-          mkdir -p "$HOME/.themes" "$HOME/.icons"
-
-          cd /tmp
-          rm -rf WhiteSur-gtk-theme WhiteSur-icon-theme
-
-          git clone --depth 1 \
-            https://github.com/vinceliuice/WhiteSur-gtk-theme.git
-          cd WhiteSur-gtk-theme
-          ./install.sh -t all
-
-          cd /tmp
-          git clone --depth 1 \
-            https://github.com/vinceliuice/WhiteSur-icon-theme.git
-          cd WhiteSur-icon-theme
-          ./install.sh
-
-          mkdir -p "$HOME/.config/autostart"
-          cat > "$HOME/.config/autostart/plank.desktop" <<'DESKTOP'
-          [Desktop Entry]
-          Type=Application
-          Name=Plank Dock
-          Exec=plank
-          X-GNOME-Autostart-enabled=true
-          DESKTOP
-
-          echo "Instalacao visual concluida."
-          echo "Abra Configuracoes do Sistema > Temas para selecionar os temas."
-          SCRIPT
-
-          sudo install -D -m 644 \
-            /tmp/mint-macos-setup.sh \
-            /usr/share/novnc/mint-macos-setup.sh
-
-      - name: Instalar Cloudflare Tunnel
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          curl -fsSL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /tmp/cloudflared
-          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
-
-      - name: Iniciar PC Virtual e noVNC
+      - name: Iniciar QEMU
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
           BOOT_MODE: ${{ inputs.boot_mode }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
           echo "::add-mask::$VNC_PASSWORD"
 
           if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
-            echo "Erro: a senha precisa ter de 6 a 8 letras ou numeros."
+            echo "A senha deve ter entre 6 e 8 letras ou numeros."
             exit 1
           fi
 
-          DISK="$HOME/virtual-pc/mint.qcow2"
-          ISO="$HOME/virtual-pc/linuxmint.iso"
+          DIR="$HOME/virtual-pc"
+          DISK="$DIR/mint.qcow2"
+          ISO="$DIR/linuxmint.iso"
 
-          if [ -w /dev/kvm ] && [ -r /dev/kvm ]; then
+          # TCG e lento; KVM e usado somente quando disponivel.
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             ACCEL=(-enable-kvm)
+            CPU=host
             echo "Aceleracao KVM disponivel."
           else
             ACCEL=(-accel tcg,thread=multi)
-            echo "KVM indisponivel; usando emulacao por software."
+            CPU=max
+            echo "Aviso: emulacao por software; desempenho limitado."
           fi
 
-          if [ "$BOOT_MODE" = "installer" ]; then
-            BOOT=(-boot order=d,menu=on)
-            echo "Modo instalador: iniciando pelo ISO do Linux Mint."
-          else
-            BOOT=(-boot order=c,menu=on)
-            echo "Modo disco: iniciando pelo sistema instalado."
-          fi
+          case "$BOOT_MODE" in
+            installer) BOOT=(-boot order=d,menu=on) ;;
+            disk) BOOT=(-boot order=c,menu=on) ;;
+            *)
+              echo "Modo de boot invalido."
+              exit 1
+              ;;
+          esac
 
-          sudo rm -f /tmp/qemu-monitor.sock
+          rm -f /tmp/qemu-monitor.sock /tmp/qemu.log
 
           qemu-system-x86_64 \
             "${ACCEL[@]}" \
             -machine pc \
-            -cpu max \
+            -cpu "$CPU" \
             -smp 2 \
             -m 4096 \
-            -drive "file=$DISK,format=qcow2,if=ide,cache=writeback" \
+            -drive "file=$DISK,format=qcow2,if=ide" \
             -cdrom "$ISO" \
             "${BOOT[@]}" \
             -vga std \
             -usb \
             -device usb-tablet \
             -rtc base=utc \
-            -boot strict=on \
             -display none \
             -vnc 127.0.0.1:1,password=on \
             -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-            -no-reboot \
             > /tmp/qemu.log 2>&1 &
 
           QEMU_PID=$!
-          echo "$QEMU_PID" > /tmp/qemu.pid
 
           cleanup() {
+            kill "${CLOUDFLARED_PID:-}" 2>/dev/null || true
+            kill "${WEBSOCKIFY_PID:-}" 2>/dev/null || true
             kill "$QEMU_PID" 2>/dev/null || true
-            sudo pkill -f 'websockify.*6080' 2>/dev/null || true
-            sudo pkill -x cloudflared 2>/dev/null || true
           }
           trap cleanup EXIT
 
-          for i in $(seq 1 30); do
-            if [ -S /tmp/qemu-monitor.sock ]; then
-              break
-            fi
+          for i in $(seq 1 40); do
+            [ -S /tmp/qemu-monitor.sock ] && break
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then
               cat /tmp/qemu.log
               exit 1
@@ -207,76 +154,88 @@ jobs:
           done
 
           if [ ! -S /tmp/qemu-monitor.sock ]; then
-            echo "QEMU nao criou o socket do monitor."
+            echo "QEMU nao criou o monitor."
             cat /tmp/qemu.log
             exit 1
           fi
 
-          {
-            printf 'change vnc password\n'
-            printf '%s\n' "$VNC_PASSWORD"
-          } | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock
+          # Envia a senha ao monitor e confere se houve erro.
+          MONITOR_OUTPUT=$(
+            printf 'change vnc password %s\n' "$VNC_PASSWORD" |
+              socat -T 5 - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>&1 || true
+          )
 
-          websockify \
-            --web=/usr/share/novnc \
-            6080 \
-            127.0.0.1:5901 \
+          if grep -qiE 'unknown command|invalid password|error' \
+            <<< "$MONITOR_OUTPUT"; then
+            echo "Erro ao configurar a senha VNC."
+            echo "$MONITOR_OUTPUT"
+            exit 1
+          fi
+
+          websockify --web=/usr/share/novnc \
+            6080 127.0.0.1:5901 \
             > /tmp/websockify.log 2>&1 &
+          WEBSOCKIFY_PID=$!
 
           sleep 3
+          if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
+            cat /tmp/websockify.log
+            exit 1
+          fi
 
-          cloudflared tunnel \
+          # Instala o Cloudflare Tunnel.
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          /tmp/cloudflared tunnel \
             --url http://127.0.0.1:6080 \
             --no-autoupdate \
             > /tmp/cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
 
+          URL=""
           for i in $(seq 1 60); do
-            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+            URL=$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
               /tmp/cloudflared.log | head -n 1 || true)
 
-            if [ -n "$URL" ]; then
-              break
-            fi
-
-            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              echo "QEMU encerrou inesperadamente:"
-              cat /tmp/qemu.log
-              exit 1
-            fi
-
+            [ -n "$URL" ] && break
+            kill -0 "$CLOUDFLARED_PID" 2>/dev/null || break
             sleep 2
           done
 
-          if [ -z "${URL:-}" ]; then
-            echo "Nao foi possivel obter o endereco publico."
+          if [ -z "$URL" ]; then
+            echo "Cloudflare nao forneceu um endereco."
             cat /tmp/cloudflared.log
-            cat /tmp/qemu.log
             exit 1
           fi
 
-          echo "======================================"
-          echo "EXTNOBRASIL PC GAMER"
-          echo "Linux Mint Cinnamon"
-          echo "RAM: 4 GB | CPUs virtuais: 2"
+          echo
+          echo "===================================="
+          echo "     EXT NOBRASIL PC GAMER"
+          echo "===================================="
+          echo "Sistema: Linux Mint XFCE"
           echo "Disco virtual: 145 GB"
-          echo "Modo: $BOOT_MODE"
-          echo "Acesso no navegador:"
-          echo "$URL/vnc.html?autoconnect=true&resize=scale"
+          echo "RAM configurada: 4 GB"
+          echo "Nucleos virtuais: 2"
+          echo "Modo de boot: $BOOT_MODE"
+          echo "Acesso: ${URL}/vnc.html?autoconnect=true&resize=scale"
           echo "Senha VNC: a senha informada ao iniciar o workflow"
-          echo "======================================"
+          echo "===================================="
 
           while kill -0 "$QEMU_PID" 2>/dev/null; do
-            sleep 15
+            sleep 10
           done
 
-          echo "QEMU encerrou. Ultimas mensagens:"
-          tail -n 100 /tmp/qemu.log
-          wait "$QEMU_PID"
+          echo "QEMU encerrou."
+          cat /tmp/qemu.log
 
       - name: Salvar disco virtual
-        if: success()
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/virtual-pc/mint.qcow2
-          key: mint-pc-${{ runner.os }}-${{ github.repository }}-${{ github.run_id }}
+          key: mint-xfce-${{ github.repository }}-${{ github.run_id }}
           
