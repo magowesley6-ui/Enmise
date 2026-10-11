@@ -18,7 +18,11 @@ on:
           - disk
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: extnobrasil-mint-pc
+  cancel-in-progress: false
 
 jobs:
   virtual-pc:
@@ -34,56 +38,106 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 qemu-utils novnc websockify \
-            socat curl wget ca-certificates
+            socat curl wget ca-certificates jq
 
+          command -v gh
           mkdir -p "$HOME/virtual-pc"
 
-      - name: Restaurar disco virtual
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/virtual-pc/mint.qcow2
-          key: mint-xfce-${{ github.repository }}-${{ github.run_id }}
-          restore-keys: |
-            mint-xfce-${{ github.repository }}-
-
-      - name: Baixar Linux Mint XFCE
+      - name: Restaurar ultimo checkpoint do GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          DIR="$HOME/virtual-pc"
+          DISK="$DIR/mint.qcow2"
+          PARTS="$DIR/restore-parts"
+          JOINED="$DIR/restored-mint.qcow2"
+
+          mkdir -p "$DIR"
+
+          echo "Procurando o ultimo checkpoint publicado..."
+
+          TAG="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName,publishedAt,isDraft \
+            --jq '[.[] |
+              select(.isDraft == false) |
+              select(.tagName | startswith("mint-checkpoint-"))] |
+              sort_by(.publishedAt) | last | .tagName // empty')"
+
+          if [ -n "$TAG" ]; then
+            echo "Checkpoint encontrado: $TAG"
+            mkdir -p "$PARTS"
+
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'mint-checkpoint-*.part' \
+              --dir "$PARTS"
+
+            shopt -s nullglob
+            FILES=("$PARTS"/mint-checkpoint-*.part)
+
+            if [ "${#FILES[@]}" -eq 0 ]; then
+              echo "ERRO: o checkpoint nao tem partes para restaurar."
+              exit 1
+            fi
+
+            cat "${FILES[@]}" > "$JOINED"
+            rm -rf "$PARTS"
+
+            echo "Verificando o disco restaurado..."
+            qemu-img check "$JOINED"
+            mv "$JOINED" "$DISK"
+
+            echo "Checkpoint restaurado com sucesso."
+            qemu-img info "$DISK"
+          else
+            echo "Nenhum checkpoint anterior encontrado."
+            echo "Um disco novo sera criado."
+          fi
+
+      - name: Preparar disco virtual
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
           DIR="$HOME/virtual-pc"
           DISK="$DIR/mint.qcow2"
           ISO="$DIR/linuxmint.iso"
 
-          # Confere se o disco restaurado e valido.
           if [ -f "$DISK" ]; then
+            echo "Usando o disco restaurado."
             qemu-img check "$DISK"
           else
+            echo "Criando disco virtual de 145 GB..."
             qemu-img create -f qcow2 "$DISK" 145G
           fi
 
-          # XFCE e mais leve que Cinnamon, mas a ISO precisa existir.
           if [ ! -s "$ISO" ]; then
             URL="https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-xfce-64bit.iso"
 
             if ! wget -O "$ISO" "$URL"; then
               rm -f "$ISO"
-              echo "Falha ao baixar a ISO XFCE."
-              echo "Confira a versao e o endereco oficial do Linux Mint."
+              echo "ERRO: falha ao baixar a ISO do Linux Mint."
               exit 1
             fi
           fi
 
           test -s "$ISO"
           qemu-img info "$DISK"
-          ls -lh "$ISO"
 
-      - name: Iniciar QEMU
+      - name: Iniciar PC Virtual e salvar checkpoint ao encerrar
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
           BOOT_MODE: ${{ inputs.boot_mode }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -Eeuo pipefail
+
           echo "::add-mask::$VNC_PASSWORD"
 
           if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
@@ -95,8 +149,214 @@ jobs:
           DISK="$DIR/mint.qcow2"
           ISO="$DIR/linuxmint.iso"
 
-          # TCG e lento; KVM e usado somente quando disponivel.
-          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+          MONITOR="/tmp/qemu-monitor.sock"
+          QEMU_LOG="/tmp/qemu.log"
+          VNC_LOG="/tmp/websockify.log"
+          TUNNEL_LOG="/tmp/cloudflared.log"
+
+          QEMU_PID=""
+          WEBSOCKIFY_PID=""
+          CLOUDFLARED_PID=""
+
+          cleanup() {
+            local EXIT_CODE=$?
+            local SAVE_OK=1
+
+            trap - EXIT INT TERM
+            set +e
+
+            echo
+            echo "===================================="
+            echo " EXT NOBRASIL - CHECKPOINT"
+            echo " Encerrando o PC virtual..."
+            echo "===================================="
+
+            # Tenta primeiro desligar o Mint pelo ACPI.
+            if [ -n "$QEMU_PID" ] &&
+               kill -0 "$QEMU_PID" 2>/dev/null &&
+               [ -S "$MONITOR" ]; then
+              printf 'system_powerdown\n' |
+                socat -T 5 - UNIX-CONNECT:"$MONITOR" \
+                >/dev/null 2>&1
+
+              for i in $(seq 1 30); do
+                kill -0 "$QEMU_PID" 2>/dev/null || break
+                sleep 1
+              done
+
+              # Se o Mint nao desligar, fecha o QEMU pelo monitor.
+              if kill -0 "$QEMU_PID" 2>/dev/null; then
+                printf 'quit\n' |
+                  socat -T 5 - UNIX-CONNECT:"$MONITOR" \
+                  >/dev/null 2>&1
+              fi
+
+              for i in $(seq 1 15); do
+                kill -0 "$QEMU_PID" 2>/dev/null || break
+                sleep 1
+              done
+
+              if kill -0 "$QEMU_PID" 2>/dev/null; then
+                echo "Aviso: QEMU nao encerrou; enviando TERM."
+                kill -TERM "$QEMU_PID" 2>/dev/null
+
+                for i in $(seq 1 5); do
+                  kill -0 "$QEMU_PID" 2>/dev/null || break
+                  sleep 1
+                done
+              fi
+
+              if kill -0 "$QEMU_PID" 2>/dev/null; then
+                echo "AVISO: encerramento forcado do QEMU."
+                kill -KILL "$QEMU_PID" 2>/dev/null
+              fi
+
+              wait "$QEMU_PID" 2>/dev/null
+            fi
+
+            if [ -n "$CLOUDFLARED_PID" ]; then
+              kill "$CLOUDFLARED_PID" 2>/dev/null
+              wait "$CLOUDFLARED_PID" 2>/dev/null
+            fi
+
+            if [ -n "$WEBSOCKIFY_PID" ]; then
+              kill "$WEBSOCKIFY_PID" 2>/dev/null
+              wait "$WEBSOCKIFY_PID" 2>/dev/null
+            fi
+
+            rm -f "$MONITOR"
+
+            # Nunca cria um backup enquanto o QEMU usa o disco.
+            if [ ! -s "$DISK" ]; then
+              echo "ERRO: disco virtual nao encontrado."
+              SAVE_OK=0
+            elif ! qemu-img check "$DISK"; then
+              echo "ERRO: verificacao do disco falhou."
+              SAVE_OK=0
+            else
+              sync
+
+              BACKUP="$DIR/mint-checkpoint.qcow2"
+              PARTS="$DIR/checkpoint-parts"
+
+              rm -rf "$PARTS"
+              mkdir -p "$PARTS"
+              rm -f "$BACKUP"
+
+              echo "Preparando imagem compactada..."
+              if qemu-img convert -p -c -O qcow2 \
+                "$DISK" "$BACKUP"; then
+
+                echo "Dividindo backup em partes de 1800 MB..."
+                if split -b 1800M -d -a 4 \
+                  --additional-suffix=.part \
+                  "$BACKUP" "$PARTS/mint-checkpoint-"; then
+
+                  # Libera espaco temporario antes do upload.
+                  rm -f "$BACKUP"
+
+                  shopt -s nullglob
+                  FILES=("$PARTS"/mint-checkpoint-*.part)
+
+                  if [ "${#FILES[@]}" -eq 0 ]; then
+                    echo "ERRO: nenhuma parte foi criada."
+                    SAVE_OK=0
+                  else
+                    TAG="mint-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+                    RELEASE_CREATED=0
+
+                    echo "Criando checkpoint no GitHub Releases..."
+
+                    if gh release create "$TAG" \
+                      --repo "$GITHUB_REPOSITORY" \
+                      --draft \
+                      --title "Mint Checkpoint ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                      --notes "Backup automatico do PC virtual ExtNoBrasil."; then
+                      RELEASE_CREATED=1
+                    else
+                      echo "ERRO: nao foi possivel criar a Release."
+                      SAVE_OK=0
+                    fi
+
+                    if [ "$RELEASE_CREATED" -eq 1 ]; then
+                      if gh release upload "$TAG" "${FILES[@]}" \
+                        --repo "$GITHUB_REPOSITORY"; then
+
+                        RELEASE_ID="$(gh api \
+                          "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+                          --jq '.id')"
+
+                        if gh api \
+                          "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+                          -X PATCH -F draft=false >/dev/null; then
+
+                          echo "Checkpoint publicado com sucesso."
+
+                          # Mantem apenas o checkpoint mais recente.
+                          OLD_TAGS="$(gh release list \
+                            --repo "$GITHUB_REPOSITORY" \
+                            --limit 100 \
+                            --json tagName,isDraft \
+                            --jq '.[] |
+                              select(.isDraft == false) |
+                              select(.tagName | startswith("mint-checkpoint-")) |
+                              .tagName' 2>/dev/null)"
+
+                          while IFS= read -r OLD_TAG; do
+                            [ -n "$OLD_TAG" ] || continue
+                            [ "$OLD_TAG" != "$TAG" ] || continue
+
+                            echo "Removendo checkpoint antigo: $OLD_TAG"
+                            gh release delete "$OLD_TAG" \
+                              --repo "$GITHUB_REPOSITORY" \
+                              --yes --cleanup-tag \
+                              || echo "Aviso: nao foi possivel remover $OLD_TAG."
+                          done <<< "$OLD_TAGS"
+
+                        else
+                          echo "ERRO: nao foi possivel publicar a Release."
+                          SAVE_OK=0
+                        fi
+                      else
+                        echo "ERRO: upload incompleto."
+                        echo "A Release incompleta continuara como rascunho."
+                        SAVE_OK=0
+                      fi
+                    fi
+                  fi
+                else
+                  echo "ERRO: falha ao dividir o backup."
+                  SAVE_OK=0
+                fi
+              else
+                echo "ERRO: falha ao compactar o disco."
+                SAVE_OK=0
+              fi
+
+              rm -rf "$PARTS"
+              rm -f "$BACKUP"
+            fi
+
+            if [ "$SAVE_OK" -eq 1 ]; then
+              echo "Resultado: checkpoint salvo."
+            else
+              echo "Resultado: NAO foi possivel confirmar o backup."
+              if [ "$EXIT_CODE" -eq 0 ]; then
+                EXIT_CODE=1
+              fi
+            fi
+
+            rm -f "$MONITOR"
+            exit "$EXIT_CODE"
+          }
+
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          if [ -c /dev/kvm ] &&
+             [ -r /dev/kvm ] &&
+             [ -w /dev/kvm ]; then
             ACCEL=(-enable-kvm)
             CPU=host
             echo "Aceleracao KVM disponivel."
@@ -107,15 +367,19 @@ jobs:
           fi
 
           case "$BOOT_MODE" in
-            installer) BOOT=(-boot order=d,menu=on) ;;
-            disk) BOOT=(-boot order=c,menu=on) ;;
+            installer)
+              BOOT=(-boot order=d,menu=on)
+              ;;
+            disk)
+              BOOT=(-boot order=c,menu=on)
+              ;;
             *)
               echo "Modo de boot invalido."
               exit 1
               ;;
           esac
 
-          rm -f /tmp/qemu-monitor.sock /tmp/qemu.log
+          rm -f "$MONITOR" "$QEMU_LOG"
 
           qemu-system-x86_64 \
             "${ACCEL[@]}" \
@@ -132,38 +396,32 @@ jobs:
             -rtc base=utc \
             -display none \
             -vnc 127.0.0.1:1,password=on \
-            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-            > /tmp/qemu.log 2>&1 &
+            -monitor unix:"$MONITOR",server,nowait \
+            > "$QEMU_LOG" 2>&1 &
 
           QEMU_PID=$!
 
-          cleanup() {
-            kill "${CLOUDFLARED_PID:-}" 2>/dev/null || true
-            kill "${WEBSOCKIFY_PID:-}" 2>/dev/null || true
-            kill "$QEMU_PID" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
           for i in $(seq 1 40); do
-            [ -S /tmp/qemu-monitor.sock ] && break
+            [ -S "$MONITOR" ] && break
+
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              cat /tmp/qemu.log
+              cat "$QEMU_LOG"
               exit 1
             fi
+
             sleep 2
           done
 
-          if [ ! -S /tmp/qemu-monitor.sock ]; then
+          if [ ! -S "$MONITOR" ]; then
             echo "QEMU nao criou o monitor."
-            cat /tmp/qemu.log
+            cat "$QEMU_LOG"
             exit 1
           fi
 
-          # Envia a senha ao monitor e confere se houve erro.
-          MONITOR_OUTPUT=$(
+          MONITOR_OUTPUT="$(
             printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-              socat -T 5 - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>&1 || true
-          )
+              socat -T 5 - UNIX-CONNECT:"$MONITOR" 2>&1 || true
+          )"
 
           if grep -qiE 'unknown command|invalid password|error' \
             <<< "$MONITOR_OUTPUT"; then
@@ -174,16 +432,16 @@ jobs:
 
           websockify --web=/usr/share/novnc \
             6080 127.0.0.1:5901 \
-            > /tmp/websockify.log 2>&1 &
+            > "$VNC_LOG" 2>&1 &
           WEBSOCKIFY_PID=$!
 
           sleep 3
+
           if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
-            cat /tmp/websockify.log
+            cat "$VNC_LOG"
             exit 1
           fi
 
-          # Instala o Cloudflare Tunnel.
           curl -fsSL \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /tmp/cloudflared
@@ -192,14 +450,15 @@ jobs:
           /tmp/cloudflared tunnel \
             --url http://127.0.0.1:6080 \
             --no-autoupdate \
-            > /tmp/cloudflared.log 2>&1 &
+            > "$TUNNEL_LOG" 2>&1 &
           CLOUDFLARED_PID=$!
 
           URL=""
+
           for i in $(seq 1 60); do
-            URL=$(grep -Eo \
+            URL="$(grep -Eo \
               'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              /tmp/cloudflared.log | head -n 1 || true)
+              "$TUNNEL_LOG" | head -n 1 || true)"
 
             [ -n "$URL" ] && break
             kill -0 "$CLOUDFLARED_PID" 2>/dev/null || break
@@ -208,7 +467,7 @@ jobs:
 
           if [ -z "$URL" ]; then
             echo "Cloudflare nao forneceu um endereco."
-            cat /tmp/cloudflared.log
+            cat "$TUNNEL_LOG"
             exit 1
           fi
 
@@ -222,20 +481,21 @@ jobs:
           echo "Nucleos virtuais: 2"
           echo "Modo de boot: $BOOT_MODE"
           echo "Acesso: ${URL}/vnc.html?autoconnect=true&resize=scale"
-          echo "Senha VNC: a senha informada ao iniciar o workflow"
+          echo "Senha VNC: a senha informada no workflow"
+          echo "Checkpoint: GitHub Releases"
           echo "===================================="
 
+          # Reserva tempo para encerrar e tentar salvar antes do limite.
+          SESSION_START=$SECONDS
+          SESSION_LIMIT=18000
+
           while kill -0 "$QEMU_PID" 2>/dev/null; do
-            sleep 10
+            if (( SECONDS - SESSION_START >= SESSION_LIMIT )); then
+              echo "Limite de sessao atingido; iniciando salvamento."
+              break
+            fi
+            sleep 5
           done
 
-          echo "QEMU encerrou."
-          cat /tmp/qemu.log
-
-      - name: Salvar disco virtual
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/virtual-pc/mint.qcow2
-          key: mint-xfce-${{ github.repository }}-${{ github.run_id }}
+          echo "Iniciando finalizacao da sessao."
           
