@@ -1,5 +1,5 @@
 
-name: ExtNoBrasil PC Gamer - Mint XFCE
+name: ExtNoBrasil PC Gamer - Bodhi Linux Preto e Vermelho
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       boot_mode:
-        description: "Primeira vez installer; depois disk"
+        description: "Primeira execucao installer; depois disk"
         required: true
         type: choice
         default: installer
@@ -21,29 +21,86 @@ permissions:
   contents: write
 
 concurrency:
-  group: extnobrasil-mint-pc
+  group: extnobrasil-bodhi-pc
   cancel-in-progress: false
 
 jobs:
   virtual-pc:
-    name: ExtNoBrasil PC Virtual
+    name: ExtNoBrasil PC Virtual Bodhi
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Instalar dependencias
+      - name: Instalar dependencias e criar papel de parede
         shell: bash
         run: |
           set -Eeuo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
-            qemu-system-x86 qemu-utils novnc websockify \
-            socat curl wget ca-certificates jq
+            qemu-system-x86 qemu-utils \
+            novnc websockify socat curl wget \
+            ca-certificates jq python3-pil \
+            guestfs-tools
 
-          command -v gh
-          mkdir -p "$HOME/virtual-pc"
+          DIR="$HOME/virtual-pc"
+          mkdir -p "$DIR"
 
-      - name: Restaurar ultimo checkpoint do GitHub Releases
+          # Gera o papel de parede sem precisar baixar uma imagem.
+          python3 - "$DIR/extnobrasil-wallpaper.png" <<'PY'
+          from PIL import Image, ImageDraw, ImageFont
+          import sys, math
+
+          W, H = 1920, 1080
+          im = Image.new("RGB", (W, H))
+          px = im.load()
+
+          for y in range(H):
+              for x in range(W):
+                  glow = max(0, 1 - math.sqrt(
+                      ((x - 1550) / 900) ** 2 +
+                      ((y - 780) / 700) ** 2
+                  ))
+                  red = int(5 + glow * 65)
+                  px[x, y] = (red, 0, 2)
+
+          d = ImageDraw.Draw(im)
+          d.polygon([(1200,0),(1920,0),(1920,1080),(1600,1080)],
+                    fill=(24,0,2))
+          d.line((0,900,900,0), fill=(220,0,20), width=4)
+          d.line((300,1080,1380,0), fill=(100,0,8), width=3)
+
+          font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+          title_font = ImageFont.truetype(font_bold, 100)
+          sub_font = ImageFont.truetype(font_bold, 57)
+          small_font = ImageFont.truetype(font_regular, 25)
+
+          title = "ExtNoBrasil"
+          box = d.textbbox((0,0), title, font=title_font)
+          d.text(((W-(box[2]-box[0]))/2, 385), title,
+                 font=title_font, fill=(255,25,40),
+                 stroke_width=1, stroke_fill=(90,0,0))
+
+          subtitle = "PC GAMER"
+          box = d.textbbox((0,0), subtitle, font=sub_font)
+          d.text(((W-(box[2]-box[0]))/2, 510), subtitle,
+                 font=sub_font, fill=(245,245,245))
+
+          d.rounded_rectangle((700,600,1220,608), radius=4,
+                              fill=(255,20,35))
+
+          small = "BODHI LINUX  |  CUSTOM EDITION"
+          box = d.textbbox((0,0), small, font=small_font)
+          d.text(((W-(box[2]-box[0]))/2, 650), small,
+                 font=small_font, fill=(190,190,190))
+
+          im.save(sys.argv[1], optimize=True)
+          print("Papel de parede ExtNoBrasil criado.")
+          PY
+
+      - name: Restaurar ultimo checkpoint Bodhi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -51,13 +108,11 @@ jobs:
           set -Eeuo pipefail
 
           DIR="$HOME/virtual-pc"
-          DISK="$DIR/mint.qcow2"
+          DISK="$DIR/bodhi.qcow2"
           PARTS="$DIR/restore-parts"
-          JOINED="$DIR/restored-mint.qcow2"
+          JOINED="$DIR/restored-bodhi.qcow2"
 
           mkdir -p "$DIR"
-
-          echo "Procurando o ultimo checkpoint publicado..."
 
           TAG="$(gh release list \
             --repo "$GITHUB_REPOSITORY" \
@@ -65,63 +120,57 @@ jobs:
             --json tagName,publishedAt,isDraft \
             --jq '[.[] |
               select(.isDraft == false) |
-              select(.tagName | startswith("mint-checkpoint-"))] |
+              select(.tagName | startswith("bodhi-checkpoint-"))] |
               sort_by(.publishedAt) | last | .tagName // empty')"
 
           if [ -n "$TAG" ]; then
-            echo "Checkpoint encontrado: $TAG"
+            echo "Restaurando checkpoint: $TAG"
             mkdir -p "$PARTS"
 
             gh release download "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --pattern 'mint-checkpoint-*.part' \
+              --pattern 'bodhi-checkpoint-*.part' \
               --dir "$PARTS"
 
             shopt -s nullglob
-            FILES=("$PARTS"/mint-checkpoint-*.part)
+            FILES=("$PARTS"/bodhi-checkpoint-*.part)
 
             if [ "${#FILES[@]}" -eq 0 ]; then
-              echo "ERRO: o checkpoint nao tem partes para restaurar."
+              echo "ERRO: checkpoint sem partes."
               exit 1
             fi
 
             cat "${FILES[@]}" > "$JOINED"
             rm -rf "$PARTS"
 
-            echo "Verificando o disco restaurado..."
             qemu-img check "$JOINED"
             mv "$JOINED" "$DISK"
-
-            echo "Checkpoint restaurado com sucesso."
-            qemu-img info "$DISK"
+            echo "Checkpoint restaurado."
           else
-            echo "Nenhum checkpoint anterior encontrado."
-            echo "Um disco novo sera criado."
+            echo "Nenhum checkpoint Bodhi anterior."
           fi
 
-      - name: Preparar disco virtual
+      - name: Preparar disco e ISO do Bodhi Linux
         shell: bash
         run: |
           set -Eeuo pipefail
 
           DIR="$HOME/virtual-pc"
-          DISK="$DIR/mint.qcow2"
-          ISO="$DIR/linuxmint.iso"
+          DISK="$DIR/bodhi.qcow2"
+          ISO="$DIR/bodhi.iso"
 
-          if [ -f "$DISK" ]; then
-            echo "Usando o disco restaurado."
-            qemu-img check "$DISK"
-          else
-            echo "Criando disco virtual de 145 GB..."
+          if [ ! -s "$DISK" ]; then
             qemu-img create -f qcow2 "$DISK" 145G
           fi
 
           if [ ! -s "$ISO" ]; then
-            URL="https://pub.linuxmint.io/stable/22.3/linuxmint-22.3-xfce-64bit.iso"
+            URL="https://sourceforge.net/projects/bodhilinux/files/7.0.0/bodhi-7.0.0-64.iso/download"
 
-            if ! wget -O "$ISO" "$URL"; then
+            if ! wget --content-disposition \
+              -O "$ISO" "$URL"; then
               rm -f "$ISO"
-              echo "ERRO: falha ao baixar a ISO do Linux Mint."
+              echo "ERRO: nao foi possivel baixar a ISO."
+              echo "Confira a ISO oficial do Bodhi Linux e atualize a URL."
               exit 1
             fi
           fi
@@ -129,7 +178,7 @@ jobs:
           test -s "$ISO"
           qemu-img info "$DISK"
 
-      - name: Iniciar PC Virtual e salvar checkpoint ao encerrar
+      - name: Iniciar PC virtual, personalizar e salvar checkpoint
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
           BOOT_MODE: ${{ inputs.boot_mode }}
@@ -138,43 +187,40 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          echo "::add-mask::$VNC_PASSWORD"
-
           if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
-            echo "A senha deve ter entre 6 e 8 letras ou numeros."
+            echo "A senha precisa ter de 6 a 8 letras ou numeros."
             exit 1
           fi
+          echo "::add-mask::$VNC_PASSWORD"
 
           DIR="$HOME/virtual-pc"
-          DISK="$DIR/mint.qcow2"
-          ISO="$DIR/linuxmint.iso"
+          DISK="$DIR/bodhi.qcow2"
+          ISO="$DIR/bodhi.iso"
+          WALL="$DIR/extnobrasil-wallpaper.png"
 
-          MONITOR="/tmp/qemu-monitor.sock"
-          QEMU_LOG="/tmp/qemu.log"
-          VNC_LOG="/tmp/websockify.log"
-          TUNNEL_LOG="/tmp/cloudflared.log"
+          MONITOR="/tmp/bodhi-monitor.sock"
+          QEMU_LOG="/tmp/bodhi-qemu.log"
+          VNC_LOG="/tmp/bodhi-websockify.log"
+          TUNNEL_LOG="/tmp/bodhi-cloudflared.log"
 
           QEMU_PID=""
           WEBSOCKIFY_PID=""
           CLOUDFLARED_PID=""
 
           cleanup() {
-            local EXIT_CODE=$?
-            local SAVE_OK=1
+            EXIT_CODE=$?
+            SAVE_OK=1
 
             trap - EXIT INT TERM
             set +e
 
             echo
-            echo "===================================="
-            echo " EXT NOBRASIL - CHECKPOINT"
-            echo " Encerrando o PC virtual..."
-            echo "===================================="
+            echo "===== EXT NOBRASIL: ENCERRANDO E SALVANDO ====="
 
-            # Tenta primeiro desligar o Mint pelo ACPI.
             if [ -n "$QEMU_PID" ] &&
                kill -0 "$QEMU_PID" 2>/dev/null &&
                [ -S "$MONITOR" ]; then
+
               printf 'system_powerdown\n' |
                 socat -T 5 - UNIX-CONNECT:"$MONITOR" \
                 >/dev/null 2>&1
@@ -184,7 +230,6 @@ jobs:
                 sleep 1
               done
 
-              # Se o Mint nao desligar, fecha o QEMU pelo monitor.
               if kill -0 "$QEMU_PID" 2>/dev/null; then
                 printf 'quit\n' |
                   socat -T 5 - UNIX-CONNECT:"$MONITOR" \
@@ -197,136 +242,107 @@ jobs:
               done
 
               if kill -0 "$QEMU_PID" 2>/dev/null; then
-                echo "Aviso: QEMU nao encerrou; enviando TERM."
                 kill -TERM "$QEMU_PID" 2>/dev/null
-
-                for i in $(seq 1 5); do
-                  kill -0 "$QEMU_PID" 2>/dev/null || break
-                  sleep 1
-                done
+                sleep 3
               fi
 
               if kill -0 "$QEMU_PID" 2>/dev/null; then
-                echo "AVISO: encerramento forcado do QEMU."
                 kill -KILL "$QEMU_PID" 2>/dev/null
               fi
 
               wait "$QEMU_PID" 2>/dev/null
             fi
 
-            if [ -n "$CLOUDFLARED_PID" ]; then
-              kill "$CLOUDFLARED_PID" 2>/dev/null
-              wait "$CLOUDFLARED_PID" 2>/dev/null
+            # Tenta aplicar o papel de parede ao Bodhi instalado.
+            # Se o disco ainda estiver vazio ou sem sistema instalado,
+            # continua o salvamento sem interromper o workflow.
+            if [ -s "$DISK" ]; then
+              echo "Configurando papel de parede preto e vermelho..."
+
+              if sudo virt-customize -a "$DISK" \
+                --install feh \
+                --mkdir /usr/share/backgrounds/extnobrasil \
+                --upload "$WALL":/usr/share/backgrounds/extnobrasil/extnobrasil-wallpaper.png \
+                --run-command \
+                  "printf '%s\n' '#!/bin/sh' 'feh --no-fehbg --bg-fill /usr/share/backgrounds/extnobrasil/extnobrasil-wallpaper.png' > /usr/local/bin/extnobrasil-wallpaper.sh && chmod 755 /usr/local/bin/extnobrasil-wallpaper.sh" \
+                --run-command \
+                  "mkdir -p /etc/xdg/autostart && printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=ExtNoBrasil Wallpaper' 'Exec=/usr/local/bin/extnobrasil-wallpaper.sh' 'Terminal=false' 'X-GNOME-Autostart-enabled=true' > /etc/xdg/autostart/extnobrasil-wallpaper.desktop"; then
+                echo "Papel de parede configurado."
+              else
+                echo "Aviso: nao foi possivel personalizar o disco nesta execucao."
+                echo "Isso pode acontecer se o Bodhi ainda nao foi instalado."
+              fi
             fi
 
-            if [ -n "$WEBSOCKIFY_PID" ]; then
-              kill "$WEBSOCKIFY_PID" 2>/dev/null
-              wait "$WEBSOCKIFY_PID" 2>/dev/null
-            fi
+            [ -n "$CLOUDFLARED_PID" ] && kill "$CLOUDFLARED_PID" 2>/dev/null
+            [ -n "$WEBSOCKIFY_PID" ] && kill "$WEBSOCKIFY_PID" 2>/dev/null
+
+            [ -n "$CLOUDFLARED_PID" ] && wait "$CLOUDFLARED_PID" 2>/dev/null
+            [ -n "$WEBSOCKIFY_PID" ] && wait "$WEBSOCKIFY_PID" 2>/dev/null
 
             rm -f "$MONITOR"
 
-            # Nunca cria um backup enquanto o QEMU usa o disco.
-            if [ ! -s "$DISK" ]; then
-              echo "ERRO: disco virtual nao encontrado."
-              SAVE_OK=0
-            elif ! qemu-img check "$DISK"; then
-              echo "ERRO: verificacao do disco falhou."
+            if [ ! -s "$DISK" ] || ! qemu-img check "$DISK"; then
+              echo "ERRO: disco ausente ou com problemas."
               SAVE_OK=0
             else
               sync
-
-              BACKUP="$DIR/mint-checkpoint.qcow2"
+              BACKUP="$DIR/bodhi-checkpoint.qcow2"
               PARTS="$DIR/checkpoint-parts"
 
               rm -rf "$PARTS"
               mkdir -p "$PARTS"
               rm -f "$BACKUP"
 
-              echo "Preparando imagem compactada..."
-              if qemu-img convert -p -c -O qcow2 \
-                "$DISK" "$BACKUP"; then
-
-                echo "Dividindo backup em partes de 1800 MB..."
-                if split -b 1800M -d -a 4 \
+              echo "Compactando disco para o checkpoint..."
+              if qemu-img convert -c -O qcow2 "$DISK" "$BACKUP"; then
+                split -b 1800M -d -a 4 \
                   --additional-suffix=.part \
-                  "$BACKUP" "$PARTS/mint-checkpoint-"; then
+                  "$BACKUP" "$PARTS/bodhi-checkpoint-"
 
-                  # Libera espaco temporario antes do upload.
-                  rm -f "$BACKUP"
+                rm -f "$BACKUP"
 
-                  shopt -s nullglob
-                  FILES=("$PARTS"/mint-checkpoint-*.part)
+                shopt -s nullglob
+                FILES=("$PARTS"/bodhi-checkpoint-*.part)
 
-                  if [ "${#FILES[@]}" -eq 0 ]; then
-                    echo "ERRO: nenhuma parte foi criada."
-                    SAVE_OK=0
-                  else
-                    TAG="mint-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-                    RELEASE_CREATED=0
+                if [ "${#FILES[@]}" -eq 0 ]; then
+                  echo "ERRO: nenhuma parte do backup foi criada."
+                  SAVE_OK=0
+                else
+                  TAG="bodhi-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-                    echo "Criando checkpoint no GitHub Releases..."
+                  if gh release create "$TAG" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --draft \
+                    --title "Bodhi Checkpoint ${GITHUB_RUN_ID}" \
+                    --notes "Checkpoint automatico ExtNoBrasil PC Gamer"; then
 
-                    if gh release create "$TAG" \
-                      --repo "$GITHUB_REPOSITORY" \
-                      --draft \
-                      --title "Mint Checkpoint ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-                      --notes "Backup automatico do PC virtual ExtNoBrasil."; then
-                      RELEASE_CREATED=1
-                    else
-                      echo "ERRO: nao foi possivel criar a Release."
-                      SAVE_OK=0
-                    fi
+                    if gh release upload "$TAG" "${FILES[@]}" \
+                      --repo "$GITHUB_REPOSITORY"; then
 
-                    if [ "$RELEASE_CREATED" -eq 1 ]; then
-                      if gh release upload "$TAG" "${FILES[@]}" \
-                        --repo "$GITHUB_REPOSITORY"; then
+                      RELEASE_ID="$(gh api \
+                        "repos/${GITHUB_REPOSITORY}/releases" \
+                        --paginate \
+                        --jq ".[] | select(.tag_name == \"$TAG\") | .id" |
+                        head -n 1)"
 
-                        RELEASE_ID="$(gh api \
-                          "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
-                          --jq '.id')"
-
-                        if gh api \
+                      if [ -n "$RELEASE_ID" ] &&
+                        gh api \
                           "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
                           -X PATCH -F draft=false >/dev/null; then
-
-                          echo "Checkpoint publicado com sucesso."
-
-                          # Mantem apenas o checkpoint mais recente.
-                          OLD_TAGS="$(gh release list \
-                            --repo "$GITHUB_REPOSITORY" \
-                            --limit 100 \
-                            --json tagName,isDraft \
-                            --jq '.[] |
-                              select(.isDraft == false) |
-                              select(.tagName | startswith("mint-checkpoint-")) |
-                              .tagName' 2>/dev/null)"
-
-                          while IFS= read -r OLD_TAG; do
-                            [ -n "$OLD_TAG" ] || continue
-                            [ "$OLD_TAG" != "$TAG" ] || continue
-
-                            echo "Removendo checkpoint antigo: $OLD_TAG"
-                            gh release delete "$OLD_TAG" \
-                              --repo "$GITHUB_REPOSITORY" \
-                              --yes --cleanup-tag \
-                              || echo "Aviso: nao foi possivel remover $OLD_TAG."
-                          done <<< "$OLD_TAGS"
-
-                        else
-                          echo "ERRO: nao foi possivel publicar a Release."
-                          SAVE_OK=0
-                        fi
+                        echo "Checkpoint publicado: $TAG"
                       else
-                        echo "ERRO: upload incompleto."
-                        echo "A Release incompleta continuara como rascunho."
+                        echo "ERRO: nao foi possivel publicar o checkpoint."
                         SAVE_OK=0
                       fi
+                    else
+                      echo "ERRO: falha no upload das partes."
+                      SAVE_OK=0
                     fi
+                  else
+                    echo "ERRO: falha ao criar a Release."
+                    SAVE_OK=0
                   fi
-                else
-                  echo "ERRO: falha ao dividir o backup."
-                  SAVE_OK=0
                 fi
               else
                 echo "ERRO: falha ao compactar o disco."
@@ -338,15 +354,12 @@ jobs:
             fi
 
             if [ "$SAVE_OK" -eq 1 ]; then
-              echo "Resultado: checkpoint salvo."
+              echo "Checkpoint salvo e verificado."
             else
-              echo "Resultado: NAO foi possivel confirmar o backup."
-              if [ "$EXIT_CODE" -eq 0 ]; then
-                EXIT_CODE=1
-              fi
+              echo "ATENCAO: nao foi possivel confirmar o checkpoint."
+              [ "$EXIT_CODE" -ne 0 ] || EXIT_CODE=1
             fi
 
-            rm -f "$MONITOR"
             exit "$EXIT_CODE"
           }
 
@@ -354,25 +367,19 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
-          if [ -c /dev/kvm ] &&
-             [ -r /dev/kvm ] &&
-             [ -w /dev/kvm ]; then
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             ACCEL=(-enable-kvm)
             CPU=host
             echo "Aceleracao KVM disponivel."
           else
             ACCEL=(-accel tcg,thread=multi)
             CPU=max
-            echo "Aviso: emulacao por software; desempenho limitado."
+            echo "Aviso: emulacao por software, desempenho limitado."
           fi
 
           case "$BOOT_MODE" in
-            installer)
-              BOOT=(-boot order=d,menu=on)
-              ;;
-            disk)
-              BOOT=(-boot order=c,menu=on)
-              ;;
+            installer) BOOT=(-boot order=d,menu=on) ;;
+            disk)      BOOT=(-boot order=c,menu=on) ;;
             *)
               echo "Modo de boot invalido."
               exit 1
@@ -403,12 +410,10 @@ jobs:
 
           for i in $(seq 1 40); do
             [ -S "$MONITOR" ] && break
-
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then
               cat "$QEMU_LOG"
               exit 1
             fi
-
             sleep 2
           done
 
@@ -418,17 +423,9 @@ jobs:
             exit 1
           fi
 
-          MONITOR_OUTPUT="$(
-            printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-              socat -T 5 - UNIX-CONNECT:"$MONITOR" 2>&1 || true
-          )"
-
-          if grep -qiE 'unknown command|invalid password|error' \
-            <<< "$MONITOR_OUTPUT"; then
-            echo "Erro ao configurar a senha VNC."
-            echo "$MONITOR_OUTPUT"
-            exit 1
-          fi
+          printf 'change vnc password %s\n' "$VNC_PASSWORD" |
+            socat -T 5 - UNIX-CONNECT:"$MONITOR" \
+            >/dev/null 2>&1 || true
 
           websockify --web=/usr/share/novnc \
             6080 127.0.0.1:5901 \
@@ -436,7 +433,6 @@ jobs:
           WEBSOCKIFY_PID=$!
 
           sleep 3
-
           if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
             cat "$VNC_LOG"
             exit 1
@@ -454,48 +450,47 @@ jobs:
           CLOUDFLARED_PID=$!
 
           URL=""
-
           for i in $(seq 1 60); do
             URL="$(grep -Eo \
               'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
               "$TUNNEL_LOG" | head -n 1 || true)"
-
             [ -n "$URL" ] && break
             kill -0 "$CLOUDFLARED_PID" 2>/dev/null || break
             sleep 2
           done
 
           if [ -z "$URL" ]; then
-            echo "Cloudflare nao forneceu um endereco."
+            echo "Nao foi possivel obter o link Cloudflare."
             cat "$TUNNEL_LOG"
             exit 1
           fi
 
           echo
-          echo "===================================="
-          echo "     EXT NOBRASIL PC GAMER"
-          echo "===================================="
-          echo "Sistema: Linux Mint XFCE"
+          echo "========================================"
+          echo " EXT NOBRASIL PC GAMER - BODHI LINUX"
+          echo "========================================"
+          echo "Visual: preto e vermelho"
+          echo "Papel de parede: ExtNoBrasil PC Gamer"
           echo "Disco virtual: 145 GB"
           echo "RAM configurada: 4 GB"
           echo "Nucleos virtuais: 2"
-          echo "Modo de boot: $BOOT_MODE"
-          echo "Acesso: ${URL}/vnc.html?autoconnect=true&resize=scale"
-          echo "Senha VNC: a senha informada no workflow"
+          echo "Modo: $BOOT_MODE"
+          echo "Acesso pelo celular:"
+          echo "${URL}/vnc.html?autoconnect=true&resize=scale"
+          echo "Senha VNC: a informada ao iniciar"
           echo "Checkpoint: GitHub Releases"
-          echo "===================================="
+          echo "========================================"
 
-          # Reserva tempo para encerrar e tentar salvar antes do limite.
-          SESSION_START=$SECONDS
-          SESSION_LIMIT=18000
+          START=$SECONDS
+          LIMIT=18000
 
           while kill -0 "$QEMU_PID" 2>/dev/null; do
-            if (( SECONDS - SESSION_START >= SESSION_LIMIT )); then
-              echo "Limite de sessao atingido; iniciando salvamento."
+            if (( SECONDS - START >= LIMIT )); then
+              echo "Tempo de sessao atingido; encerrando para salvar."
               break
             fi
             sleep 5
           done
 
-          echo "Iniciando finalizacao da sessao."
+          echo "Finalizando a sessao."
           
