@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "Senha VNC (6 a 8 caracteres)"
+        description: "Senha VNC de 6 a 8 caracteres"
         required: true
         type: string
         default: "ExT2026"
@@ -25,46 +25,57 @@ jobs:
           sudo apt-get install -y \
             qemu-system-x86 qemu-utils ovmf \
             novnc websockify socat curl wget \
-            openssh-client ca-certificates
+            ca-certificates
 
-      - name: Verificar ISO do Windows
-        env:
-          WINDOWS_ISO_URL: ${{ secrets.WINDOWS_ISO_URL }}
+      - name: Preparar disco e ISO
         run: |
           set -Eeuo pipefail
-
-          if [ -z "${WINDOWS_ISO_URL:-}" ]; then
-            echo "::error::Configure o segredo WINDOWS_ISO_URL com uma URL válida da ISO do Windows 11."
-            exit 1
-          fi
-
           mkdir -p "$HOME/virtual-pc"
           cd "$HOME/virtual-pc"
 
-          if [ ! -f windows11.iso ]; then
-            curl -fL --retry 3 \
-              "$WINDOWS_ISO_URL" \
-              -o windows11.iso
+          # A ISO precisa ser fornecida por uma fonte válida.
+          # Não usar páginas HTML como se fossem arquivos ISO.
+          echo "Tentando localizar uma ISO oficial..."
+          echo "Se não houver URL direta disponível, a execução será interrompida."
+          echo "Consulte: https://www.microsoft.com/software-download/windows11"
+
+          if [ ! -s windows11.iso ]; then
+            echo "::error::A Microsoft não fornece um endereço de ISO permanente garantido para automação. É necessário obter uma URL direta válida ou disponibilizar a ISO."
+            exit 1
           fi
 
-          qemu-img create -f qcow2 windows11.qcow2 80G
+          if [ ! -f windows11.qcow2 ]; then
+            qemu-img create -f qcow2 windows11.qcow2 80G
+          fi
 
-      - name: Iniciar PC virtual
+      - name: Iniciar Windows no QEMU
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
         run: |
           set -Eeuo pipefail
           cd "$HOME/virtual-pc"
 
-          # Inicia o QEMU com UEFI e instalador do Windows.
+          if [ "${#VNC_PASSWORD}" -lt 6 ] ||
+             [ "${#VNC_PASSWORD}" -gt 8 ]; then
+            echo "::error::A senha precisa ter de 6 a 8 caracteres."
+            exit 1
+          fi
+
+          # O acelerador KVM é usado quando disponível.
+          # Em TCG, o desempenho pode ser muito baixo.
+          ACCEL=tcg
+          if [ -e /dev/kvm ]; then
+            ACCEL=kvm
+          fi
+
           qemu-system-x86_64 \
             -name "ExtNoBrasil PC Gamer" \
-            -machine q35,accel=kvm:tcg \
+            -machine "q35,accel=$ACCEL" \
             -cpu max \
             -smp 4 \
             -m 6G \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-            -drive file=windows11.qcow2,format=qcow2,if=virtio \
+            -drive file=windows11.qcow2,format=qcow2 \
             -cdrom windows11.iso \
             -boot order=d \
             -vga std \
@@ -76,67 +87,57 @@ jobs:
             -daemonize
 
           sleep 3
-
-          # Define a senha VNC.
           printf 'change vnc password %s\n' "$VNC_PASSWORD" |
             socat - UNIX-CONNECT:"$HOME/qemu-monitor.sock"
 
-      - name: Iniciar noVNC
+      - name: Iniciar servidor noVNC
         run: |
           set -Eeuo pipefail
 
           websockify \
             --web=/usr/share/novnc \
-            6080 localhost:5900 \
+            6080 127.0.0.1:5900 \
             > "$HOME/novnc.log" 2>&1 &
 
           sleep 3
+          curl -fsS http://127.0.0.1:6080/ >/dev/null
 
-          if ! curl -fsS http://127.0.0.1:6080/ >/dev/null; then
-            echo "::error::O servidor noVNC não iniciou."
-            cat "$HOME/novnc.log"
-            exit 1
-          fi
-
-      - name: Publicar acesso pelo navegador
+      - name: Publicar link noVNC
         run: |
           set -Eeuo pipefail
 
-          # O Cloudflare Tunnel exige o executável cloudflared.
           wget -q \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -O "$HOME/cloudflared"
-
           chmod +x "$HOME/cloudflared"
 
           "$HOME/cloudflared" tunnel \
             --url http://127.0.0.1:6080 \
             > "$HOME/cloudflared.log" 2>&1 &
 
+          URL=""
           for i in $(seq 1 60); do
-            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+            URL=$(grep -Eo \
+              'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
               "$HOME/cloudflared.log" | head -n 1 || true)
-
-            if [ -n "$URL" ]; then
-              echo "======================================"
-              echo "ExtNoBrasil PC Gamer"
-              echo "Acesso pelo navegador: $URL/vnc.html"
-              echo "Senha VNC: configure a senha informada"
-              echo "======================================"
-              break
-            fi
-
+            [ -n "$URL" ] && break
             sleep 2
           done
 
-          if [ -z "${URL:-}" ]; then
-            echo "::error::Não foi possível obter o link noVNC."
+          if [ -z "$URL" ]; then
             cat "$HOME/cloudflared.log"
+            echo "::error::Não foi possível gerar o link noVNC."
             exit 1
           fi
 
+          echo "======================================"
+          echo "ExtNoBrasil PC Gamer"
+          echo "Link noVNC: $URL/vnc.html"
+          echo "Senha VNC: a senha informada na execução"
+          echo "======================================"
+
       - name: Manter sessão ativa
         run: |
-          echo "O PC virtual ficará disponível enquanto o job estiver ativo."
-          echo "O disco não tem backup permanente neste workflow."
+          echo "O PC fica disponível enquanto o job estiver ativo."
+          echo "O disco deste runner não é armazenamento permanente."
           sleep 18000
