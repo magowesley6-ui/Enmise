@@ -1,173 +1,348 @@
 
-name: ExtNoBrasil PC Gamer - bVNC sem Tailscale
+name: ExtNoBrasil PC Gamer - Garuda Mokka Catppuccin
 
 on:
   workflow_dispatch:
     inputs:
-      rdp_password:
-        description: "Senha do bVNC (8 a 64 caracteres)"
+      vnc_password:
+        description: "Senha VNC: 6 a 8 letras ou números"
         required: true
         type: string
+      boot_mode:
+        description: "Primeira execução: installer; depois: disk"
+        required: true
+        type: choice
+        default: installer
+        options:
+          - installer
+          - disk
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: extnobrasil-garuda-pc
+  cancel-in-progress: false
 
 jobs:
-  pc-virtual:
-    runs-on: windows-latest
+  virtual-pc:
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Configurar RDP e túnel
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ inputs.rdp_password }}
+      - name: Instalar dependências
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 qemu-utils \
+            novnc websockify socat \
+            curl wget ca-certificates \
+            openssh-client jq gh
 
-          # Validar a senha
-          if ($env:RDP_PASSWORD.Length -lt 8 -or
-              $env:RDP_PASSWORD.Length -gt 64) {
-            throw "A senha deve ter entre 8 e 64 caracteres."
+          mkdir -p "$HOME/virtual-pc"
+
+      - name: Restaurar checkpoint anterior
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$HOME/virtual-pc"
+
+          TAG="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName,publishedAt,isDraft \
+            --jq '[.[] |
+              select(.isDraft == false) |
+              select(.tagName | startswith("garuda-checkpoint-"))] |
+              sort_by(.publishedAt) | last | .tagName // empty')"
+
+          if [ -n "$TAG" ]; then
+            echo "Restaurando checkpoint: $TAG"
+            mkdir -p partes
+
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'garuda-checkpoint-*.part' \
+              --dir partes
+
+            shopt -s nullglob
+            ARQUIVOS=(partes/garuda-checkpoint-*.part)
+
+            if [ "${#ARQUIVOS[@]}" -eq 0 ]; then
+              echo "Checkpoint sem partes; interrompendo."
+              exit 1
+            fi
+
+            cat "${ARQUIVOS[@]}" > restaurado.qcow2
+            qemu-img check restaurado.qcow2
+            mv restaurado.qcow2 garuda.qcow2
+            rm -rf partes
+            echo "Checkpoint restaurado."
+          else
+            echo "Nenhum checkpoint anterior encontrado."
+          fi
+
+      - name: Baixar Garuda Mokka e preparar disco
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$HOME/virtual-pc"
+
+          ISO_URL="https://sourceforge.net/projects/garuda-linux/files/garuda/mokka/260819/garuda-mokka-linux-garuda-260819.iso/download"
+
+          if [ ! -s garuda.iso ]; then
+            wget --timeout=60 --tries=3 \
+              -O garuda.iso "$ISO_URL"
+          fi
+
+          test -s garuda.iso
+
+          if [ ! -s garuda.qcow2 ]; then
+            qemu-img create -f qcow2 garuda.qcow2 145G
+          fi
+
+          qemu-img info garuda.qcow2
+          df -h "$HOME"
+
+      - name: Iniciar PC virtual e conexões
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VNC_PASSWORD: ${{ inputs.vnc_password }}
+          BOOT_MODE: ${{ inputs.boot_mode }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
+            echo "A senha deve ter de 6 a 8 caracteres alfanuméricos."
+            exit 1
+          fi
+          echo "::add-mask::$VNC_PASSWORD"
+
+          cd "$HOME/virtual-pc"
+
+          MON=/tmp/garuda-monitor.sock
+          QLOG=/tmp/garuda-qemu.log
+          WLOG=/tmp/garuda-websockify.log
+          CLOG=/tmp/garuda-cloudflared.log
+          PLOG=/tmp/garuda-pinggy.log
+
+          QPID=""
+          WPID=""
+          CPID=""
+          TPID=""
+
+          salvar_checkpoint() {
+            set +e
+            echo "Preparando backup do disco virtual..."
+
+            if [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
+              if [ -S "$MON" ]; then
+                printf 'system_powerdown\n' |
+                  socat -T 5 - UNIX-CONNECT:"$MON" \
+                  >/dev/null 2>&1
+              fi
+
+              for i in $(seq 1 20); do
+                kill -0 "$QPID" 2>/dev/null || break
+                sleep 1
+              done
+
+              if kill -0 "$QPID" 2>/dev/null; then
+                kill "$QPID" 2>/dev/null
+                sleep 2
+              fi
+              wait "$QPID" 2>/dev/null
+            fi
+
+            for PID in "$TPID" "$CPID" "$WPID"; do
+              if [ -n "$PID" ]; then
+                kill "$PID" 2>/dev/null
+              fi
+            done
+
+            if [ ! -s garuda.qcow2 ] ||
+               ! qemu-img check garuda.qcow2; then
+              echo "Disco ausente ou inconsistente; backup ignorado."
+              return 1
+            fi
+
+            rm -f checkpoint.qcow2
+            rm -rf checkpoint-partes
+            mkdir -p checkpoint-partes
+
+            if ! qemu-img convert -c -O qcow2 \
+                garuda.qcow2 checkpoint.qcow2; then
+              echo "Falha ao compactar o disco."
+              return 1
+            fi
+
+            split -b 1800M -d -a 4 \
+              --additional-suffix=.part \
+              checkpoint.qcow2 \
+              checkpoint-partes/garuda-checkpoint-
+
+            shopt -s nullglob
+            PARTES=(checkpoint-partes/garuda-checkpoint-*.part)
+
+            if [ "${#PARTES[@]}" -eq 0 ]; then
+              echo "Nenhuma parte do backup foi gerada."
+              return 1
+            fi
+
+            TAG="garuda-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+            if gh release create "$TAG" "${PARTES[@]}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "ExtNoBrasil Garuda checkpoint ${GITHUB_RUN_ID}" \
+                --notes "Checkpoint do disco Garuda Mokka."; then
+              echo "Backup enviado: $TAG"
+            else
+              echo "Falha ao enviar o backup para GitHub Releases."
+              return 1
+            fi
+
+            rm -rf checkpoint-partes checkpoint.qcow2
           }
 
-          Write-Output "::add-mask::$env:RDP_PASSWORD"
-
-          # Ativar Área de Trabalho Remota
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
-
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
-
-          # Criar ou atualizar o usuário Skyro
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
-
-          if (Get-LocalUser -Name 'Skyro' -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name 'Skyro' -Password $securePassword
-          } else {
-            New-LocalUser -Name 'Skyro' `
-              -Password $securePassword `
-              -PasswordNeverExpires
+          cleanup() {
+            RC=$?
+            trap - EXIT INT TERM
+            salvar_checkpoint || RC=1
+            exit "$RC"
           }
 
-          Add-LocalGroupMember -Group 'Administrators' `
-            -Member 'Skyro' -ErrorAction SilentlyContinue
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
 
-          Add-LocalGroupMember -Group 'Remote Desktop Users' `
-            -Member 'Skyro' -ErrorAction SilentlyContinue
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL=(-enable-kvm)
+            CPU=host
+            echo "Aceleração KVM disponível."
+          else
+            ACCEL=(-accel tcg,thread=multi)
+            CPU=max
+            echo "Aviso: emulação por software; desempenho reduzido."
+          fi
 
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          if [ "$BOOT_MODE" = "installer" ]; then
+            BOOT=(-boot order=d,menu=on)
+          else
+            BOOT=(-boot order=c,menu=on)
+          fi
 
-          # Aguardar a porta local do RDP
-          $ready = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 2
-            if (Test-NetConnection 127.0.0.1 -Port 3389 `
-                -WarningAction SilentlyContinue |
-                Select-Object -ExpandProperty TcpTestSucceeded) {
-              $ready = $true
+          rm -f "$MON" "$QLOG"
+
+          qemu-system-x86_64 \
+            "${ACCEL[@]}" \
+            -machine q35 -cpu "$CPU" \
+            -smp 2 -m 6144 \
+            -drive file=garuda.qcow2,format=qcow2,if=virtio \
+            -cdrom garuda.iso \
+            "${BOOT[@]}" \
+            -vga std -usb -device usb-tablet \
+            -rtc base=utc -display none \
+            -vnc 127.0.0.1:1,password=on \
+            -monitor unix:"$MON",server,nowait \
+            > "$QLOG" 2>&1 &
+
+          QPID=$!
+
+          for i in $(seq 1 30); do
+            [ -S "$MON" ] && break
+            kill -0 "$QPID" 2>/dev/null || {
+              cat "$QLOG"
+              exit 1
+            }
+            sleep 2
+          done
+
+          [ -S "$MON" ] || {
+            cat "$QLOG"
+            exit 1
+          }
+
+          printf 'change vnc password %s\n' "$VNC_PASSWORD" |
+            socat -T 5 - UNIX-CONNECT:"$MON" \
+            >/dev/null 2>&1 || true
+
+          websockify --web=/usr/share/novnc \
+            6080 127.0.0.1:5901 > "$WLOG" 2>&1 &
+          WPID=$!
+
+          curl -fsSL --retry 3 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          /tmp/cloudflared tunnel \
+            --url http://127.0.0.1:6080 \
+            --no-autoupdate > "$CLOG" 2>&1 &
+          CPID=$!
+
+          WEB_URL=""
+          for i in $(seq 1 60); do
+            WEB_URL="$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              "$CLOG" | head -n 1 || true)"
+            [ -n "$WEB_URL" ] && break
+            sleep 2
+          done
+
+          ssh -p 443 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 \
+            -o ExitOnForwardFailure=yes \
+            -R0:localhost:5901 \
+            tcp@a.pinggy.io > "$PLOG" 2>&1 &
+          TPID=$!
+
+          TCP_URL=""
+          for i in $(seq 1 60); do
+            TCP_URL="$(grep -Eo \
+              'tcp://[^[:space:]]+' "$PLOG" | head -n 1 || true)"
+            [ -n "$TCP_URL" ] && break
+            sleep 2
+          done
+
+          echo
+          echo "===== EXT NOBRASIL PC GAMER ====="
+          echo "Sistema: Garuda Linux Mokka / KDE Plasma"
+          echo "Disco virtual: 145 GB"
+          echo "RAM da VM: 6 GB"
+          echo "vCPU: 2"
+          echo "Modo: $BOOT_MODE"
+
+          if [ -n "$WEB_URL" ]; then
+            echo "noVNC: ${WEB_URL}/vnc.html?autoconnect=true&resize=scale"
+          else
+            echo "Aviso: link noVNC não foi detectado."
+            cat "$CLOG" || true
+          fi
+
+          if [ -n "$TCP_URL" ]; then
+            echo "Endereço TCP para bVNC: $TCP_URL"
+          else
+            echo "Aviso: túnel TCP não foi detectado."
+            cat "$PLOG" || true
+          fi
+
+          echo "No bVNC, separe o host e a porta do endereço TCP."
+          echo "Use a senha configurada ao iniciar esta execução."
+          echo "Mantenha o workflow em execução."
+
+          INICIO=$SECONDS
+          while kill -0 "$QPID" 2>/dev/null; do
+            if (( SECONDS - INICIO >= 18000 )); then
+              echo "Limite da sessão atingido."
               break
-            }
-          }
-
-          if (-not $ready) {
-            throw "O serviço RDP não abriu a porta 3389."
-          }
-
-          # Verificar o SSH
-          $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
-
-          if (-not $ssh) {
-            Add-WindowsCapability -Online `
-              -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
-            $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
-          }
-
-          if (-not $ssh) {
-            throw "Não foi possível instalar o cliente SSH."
-          }
-
-          # Iniciar o túnel Pinggy
-          $outFile = Join-Path $env:TEMP 'pinggy-out.txt'
-          $errFile = Join-Path $env:TEMP 'pinggy-err.txt'
-          Remove-Item $outFile, $errFile -Force `
-            -ErrorAction SilentlyContinue
-
-          $sshArgs = @(
-            '-T'
-            '-o', 'StrictHostKeyChecking=no'
-            '-o', 'ServerAliveInterval=30'
-            '-o', 'ServerAliveCountMax=3'
-            '-p', '443'
-            '-R', '0:localhost:3389'
-            'tcp@a.pinggy.io'
-          )
-
-          $tunnel = Start-Process `
-            -FilePath $ssh.Source `
-            -ArgumentList $sshArgs `
-            -PassThru `
-            -RedirectStandardOutput $outFile `
-            -RedirectStandardError $errFile
-
-          $server = $null
-          $port = $null
-
-          # Esperar pelo endereço real
-          for ($i = 0; $i -lt 90; $i++) {
-            Start-Sleep -Seconds 2
-            $tunnel.Refresh()
-
-            if ($tunnel.HasExited) {
-              break
-            }
-
-            $log = ''
-            if (Test-Path $outFile) {
-              $log += Get-Content $outFile -Raw `
-                -ErrorAction SilentlyContinue
-            }
-            if (Test-Path $errFile) {
-              $log += Get-Content $errFile -Raw `
-                -ErrorAction SilentlyContinue
-            }
-
-            $match = [regex]::Match(
-              $log,
-              'tcp://([a-zA-Z0-9.-]+):(\d+)'
-            )
-
-            if ($match.Success) {
-              $server = $match.Groups[1].Value
-              $port = $match.Groups[2].Value
-              break
-            }
-          }
-
-          if (-not $server -or -not $port) {
-            Stop-Process -Id $tunnel.Id -Force `
-              -ErrorAction SilentlyContinue
-            throw "O túnel não forneceu servidor e porta. O serviço Pinggy pode estar indisponível ou exigir configuração adicional."
-          }
-
-          # Exibir somente servidor e porta
-          Write-Output ""
-          Write-Output "Servidor: $server"
-          Write-Output "Porta: $port"
-
-          # Manter a sessão ativa
-          while ($true) {
-            Start-Sleep -Seconds 15
-            $tunnel.Refresh()
-
-            if ($tunnel.HasExited) {
-              throw "O túnel foi desconectado."
-            }
-          }
+            fi
+            sleep 5
+          done
           
