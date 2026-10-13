@@ -1,15 +1,15 @@
 
-name: ExtNoBrasil PC Gamer - Bodhi Linux Preto e Vermelho
+name: ExtNoBrasil PC Gamer - Bodhi Linux + bVNC
 
 on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "Senha VNC de 6 a 8 letras ou numeros"
+        description: "Senha VNC exclusiva, de 6 a 8 caracteres"
         required: true
         type: string
       boot_mode:
-        description: "Primeira execucao installer; depois disk"
+        description: "Primeira vez: installer; depois: disk"
         required: true
         type: choice
         default: installer
@@ -26,93 +26,54 @@ concurrency:
 
 jobs:
   virtual-pc:
-    name: ExtNoBrasil PC Virtual Bodhi
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Instalar dependencias e criar papel de parede
+      - name: Instalar dependencias
         shell: bash
         run: |
           set -Eeuo pipefail
-
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 qemu-utils \
             novnc websockify socat curl wget \
-            ca-certificates jq python3-pil \
-            guestfs-tools
+            ca-certificates jq openssh-client python3-pil
 
-          DIR="$HOME/virtual-pc"
-          mkdir -p "$DIR"
+          mkdir -p "$HOME/virtual-pc"
 
-          # Gera o papel de parede sem precisar baixar uma imagem.
-          python3 - "$DIR/extnobrasil-wallpaper.png" <<'PY'
+      - name: Criar papel de parede ExtNoBrasil
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - "$HOME/virtual-pc/wallpaper.png" <<'PY'
           from PIL import Image, ImageDraw, ImageFont
-          import sys, math
-
-          W, H = 1920, 1080
-          im = Image.new("RGB", (W, H))
-          px = im.load()
-
-          for y in range(H):
-              for x in range(W):
-                  glow = max(0, 1 - math.sqrt(
-                      ((x - 1550) / 900) ** 2 +
-                      ((y - 780) / 700) ** 2
-                  ))
-                  red = int(5 + glow * 65)
-                  px[x, y] = (red, 0, 2)
-
+          import sys
+          im = Image.new("RGB", (1280, 720), (5, 0, 3))
           d = ImageDraw.Draw(im)
-          d.polygon([(1200,0),(1920,0),(1920,1080),(1600,1080)],
-                    fill=(24,0,2))
-          d.line((0,900,900,0), fill=(220,0,20), width=4)
-          d.line((300,1080,1380,0), fill=(100,0,8), width=3)
-
-          font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-
-          title_font = ImageFont.truetype(font_bold, 100)
-          sub_font = ImageFont.truetype(font_bold, 57)
-          small_font = ImageFont.truetype(font_regular, 25)
-
-          title = "ExtNoBrasil"
-          box = d.textbbox((0,0), title, font=title_font)
-          d.text(((W-(box[2]-box[0]))/2, 385), title,
-                 font=title_font, fill=(255,25,40),
-                 stroke_width=1, stroke_fill=(90,0,0))
-
-          subtitle = "PC GAMER"
-          box = d.textbbox((0,0), subtitle, font=sub_font)
-          d.text(((W-(box[2]-box[0]))/2, 510), subtitle,
-                 font=sub_font, fill=(245,245,245))
-
-          d.rounded_rectangle((700,600,1220,608), radius=4,
-                              fill=(255,20,35))
-
-          small = "BODHI LINUX  |  CUSTOM EDITION"
-          box = d.textbbox((0,0), small, font=small_font)
-          d.text(((W-(box[2]-box[0]))/2, 650), small,
-                 font=small_font, fill=(190,190,190))
-
-          im.save(sys.argv[1], optimize=True)
-          print("Papel de parede ExtNoBrasil criado.")
+          d.polygon([(900,0),(1280,0),(1280,720),(1080,720)],
+                    fill=(55,0,8))
+          d.line((0,650,800,0), fill=(190,0,20), width=4)
+          d.line((300,720,1100,0), fill=(90,0,10), width=3)
+          bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          f1 = ImageFont.truetype(bold, 72)
+          f2 = ImageFont.truetype(bold, 42)
+          d.text((640,280), "ExtNoBrasil", font=f1,
+                 fill=(255,25,45), anchor="mm")
+          d.text((640,370), "PC GAMER", font=f2,
+                 fill=(245,245,245), anchor="mm")
+          d.text((640,430), "BODHI LINUX | CUSTOM EDITION",
+                 fill=(190,190,190), anchor="mm")
+          im.save(sys.argv[1])
           PY
 
-      - name: Restaurar ultimo checkpoint Bodhi
+      - name: Restaurar ultimo checkpoint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          DIR="$HOME/virtual-pc"
-          DISK="$DIR/bodhi.qcow2"
-          PARTS="$DIR/restore-parts"
-          JOINED="$DIR/restored-bodhi.qcow2"
-
-          mkdir -p "$DIR"
+          cd "$HOME/virtual-pc"
 
           TAG="$(gh release list \
             --repo "$GITHUB_REPOSITORY" \
@@ -124,320 +85,195 @@ jobs:
               sort_by(.publishedAt) | last | .tagName // empty')"
 
           if [ -n "$TAG" ]; then
-            echo "Restaurando checkpoint: $TAG"
-            mkdir -p "$PARTS"
-
+            echo "Restaurando $TAG"
+            mkdir -p parts
             gh release download "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --pattern 'bodhi-checkpoint-*.part' \
-              --dir "$PARTS"
+              --dir parts
 
             shopt -s nullglob
-            FILES=("$PARTS"/bodhi-checkpoint-*.part)
-
+            FILES=(parts/bodhi-checkpoint-*.part)
             if [ "${#FILES[@]}" -eq 0 ]; then
-              echo "ERRO: checkpoint sem partes."
+              echo "ERRO: checkpoint sem arquivos."
               exit 1
             fi
 
-            cat "${FILES[@]}" > "$JOINED"
-            rm -rf "$PARTS"
-
-            qemu-img check "$JOINED"
-            mv "$JOINED" "$DISK"
+            cat "${FILES[@]}" > bodhi-restored.qcow2
+            qemu-img check bodhi-restored.qcow2
+            mv bodhi-restored.qcow2 bodhi.qcow2
+            rm -rf parts
             echo "Checkpoint restaurado."
           else
-            echo "Nenhum checkpoint Bodhi anterior."
+            echo "Nenhum checkpoint anterior."
           fi
 
-      - name: Preparar disco e ISO do Bodhi Linux
+      - name: Baixar ISO e preparar disco
         shell: bash
         run: |
           set -Eeuo pipefail
+          cd "$HOME/virtual-pc"
 
-          DIR="$HOME/virtual-pc"
-          DISK="$DIR/bodhi.qcow2"
-          ISO="$DIR/bodhi.iso"
-
-          if [ ! -s "$DISK" ]; then
-            qemu-img create -f qcow2 "$DISK" 145G
+          if [ ! -s bodhi.qcow2 ]; then
+            qemu-img create -f qcow2 bodhi.qcow2 145G
           fi
 
-          if [ ! -s "$ISO" ]; then
-            URL="https://sourceforge.net/projects/bodhilinux/files/7.0.0/bodhi-7.0.0-64.iso/download"
-
-            if ! wget --content-disposition \
-              -O "$ISO" "$URL"; then
-              rm -f "$ISO"
-              echo "ERRO: nao foi possivel baixar a ISO."
-              echo "Confira a ISO oficial do Bodhi Linux e atualize a URL."
-              exit 1
-            fi
+          if [ ! -s bodhi.iso ]; then
+            wget -O bodhi.iso \
+              "https://sourceforge.net/projects/bodhilinux/files/7.0.0/bodhi-7.0.0-64.iso/download"
           fi
 
-          test -s "$ISO"
-          qemu-img info "$DISK"
+          test -s bodhi.iso
+          qemu-img info bodhi.qcow2
 
-      - name: Iniciar PC virtual, personalizar e salvar checkpoint
+      - name: Iniciar Bodhi, noVNC e tunel TCP
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
           BOOT_MODE: ${{ inputs.boot_mode }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
           if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
-            echo "A senha precisa ter de 6 a 8 letras ou numeros."
+            echo "A senha deve ter de 6 a 8 letras ou numeros."
             exit 1
           fi
           echo "::add-mask::$VNC_PASSWORD"
 
-          DIR="$HOME/virtual-pc"
-          DISK="$DIR/bodhi.qcow2"
-          ISO="$DIR/bodhi.iso"
-          WALL="$DIR/extnobrasil-wallpaper.png"
+          cd "$HOME/virtual-pc"
+          MON=/tmp/bodhi-monitor.sock
+          QLOG=/tmp/bodhi-qemu.log
+          BLOG=/tmp/bodhi-websockify.log
+          CLOG=/tmp/bodhi-cloudflared.log
+          PLOG=/tmp/bodhi-pinggy.log
 
-          MONITOR="/tmp/bodhi-monitor.sock"
-          QEMU_LOG="/tmp/bodhi-qemu.log"
-          VNC_LOG="/tmp/bodhi-websockify.log"
-          TUNNEL_LOG="/tmp/bodhi-cloudflared.log"
-
-          QEMU_PID=""
-          WEBSOCKIFY_PID=""
-          CLOUDFLARED_PID=""
+          QPID=""
+          WPID=""
+          CPID=""
+          PPID_TUNNEL=""
 
           cleanup() {
-            EXIT_CODE=$?
-            SAVE_OK=1
-
+            RC=$?
             trap - EXIT INT TERM
             set +e
 
-            echo
-            echo "===== EXT NOBRASIL: ENCERRANDO E SALVANDO ====="
+            echo "Encerrando serviços..."
 
-            if [ -n "$QEMU_PID" ] &&
-               kill -0 "$QEMU_PID" 2>/dev/null &&
-               [ -S "$MONITOR" ]; then
-
+            if [ -S "$MON" ]; then
               printf 'system_powerdown\n' |
-                socat -T 5 - UNIX-CONNECT:"$MONITOR" \
-                >/dev/null 2>&1
-
-              for i in $(seq 1 30); do
-                kill -0 "$QEMU_PID" 2>/dev/null || break
-                sleep 1
-              done
-
-              if kill -0 "$QEMU_PID" 2>/dev/null; then
-                printf 'quit\n' |
-                  socat -T 5 - UNIX-CONNECT:"$MONITOR" \
-                  >/dev/null 2>&1
-              fi
-
-              for i in $(seq 1 15); do
-                kill -0 "$QEMU_PID" 2>/dev/null || break
-                sleep 1
-              done
-
-              if kill -0 "$QEMU_PID" 2>/dev/null; then
-                kill -TERM "$QEMU_PID" 2>/dev/null
-                sleep 3
-              fi
-
-              if kill -0 "$QEMU_PID" 2>/dev/null; then
-                kill -KILL "$QEMU_PID" 2>/dev/null
-              fi
-
-              wait "$QEMU_PID" 2>/dev/null
+                socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1
             fi
 
-            # Tenta aplicar o papel de parede ao Bodhi instalado.
-            # Se o disco ainda estiver vazio ou sem sistema instalado,
-            # continua o salvamento sem interromper o workflow.
-            if [ -s "$DISK" ]; then
-              echo "Configurando papel de parede preto e vermelho..."
-
-              if sudo virt-customize -a "$DISK" \
-                --install feh \
-                --mkdir /usr/share/backgrounds/extnobrasil \
-                --upload "$WALL":/usr/share/backgrounds/extnobrasil/extnobrasil-wallpaper.png \
-                --run-command \
-                  "printf '%s\n' '#!/bin/sh' 'feh --no-fehbg --bg-fill /usr/share/backgrounds/extnobrasil/extnobrasil-wallpaper.png' > /usr/local/bin/extnobrasil-wallpaper.sh && chmod 755 /usr/local/bin/extnobrasil-wallpaper.sh" \
-                --run-command \
-                  "mkdir -p /etc/xdg/autostart && printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=ExtNoBrasil Wallpaper' 'Exec=/usr/local/bin/extnobrasil-wallpaper.sh' 'Terminal=false' 'X-GNOME-Autostart-enabled=true' > /etc/xdg/autostart/extnobrasil-wallpaper.desktop"; then
-                echo "Papel de parede configurado."
-              else
-                echo "Aviso: nao foi possivel personalizar o disco nesta execucao."
-                echo "Isso pode acontecer se o Bodhi ainda nao foi instalado."
-              fi
+            if [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
+              sleep 5
+              printf 'quit\n' |
+                socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1
+              sleep 2
+              kill "$QPID" 2>/dev/null
+              wait "$QPID" 2>/dev/null
             fi
 
-            [ -n "$CLOUDFLARED_PID" ] && kill "$CLOUDFLARED_PID" 2>/dev/null
-            [ -n "$WEBSOCKIFY_PID" ] && kill "$WEBSOCKIFY_PID" 2>/dev/null
+            for PID in "$PPID_TUNNEL" "$CPID" "$WPID"; do
+              [ -n "$PID" ] && kill "$PID" 2>/dev/null
+            done
 
-            [ -n "$CLOUDFLARED_PID" ] && wait "$CLOUDFLARED_PID" 2>/dev/null
-            [ -n "$WEBSOCKIFY_PID" ] && wait "$WEBSOCKIFY_PID" 2>/dev/null
+            if [ -s bodhi.qcow2 ] && qemu-img check bodhi.qcow2; then
+              echo "Compactando checkpoint..."
+              qemu-img convert -c -O qcow2 \
+                bodhi.qcow2 checkpoint.qcow2
 
-            rm -f "$MONITOR"
+              mkdir -p checkpoint-parts
+              split -b 1800M -d -a 4 \
+                --additional-suffix=.part \
+                checkpoint.qcow2 checkpoint-parts/bodhi-checkpoint-
 
-            if [ ! -s "$DISK" ] || ! qemu-img check "$DISK"; then
-              echo "ERRO: disco ausente ou com problemas."
-              SAVE_OK=0
-            else
-              sync
-              BACKUP="$DIR/bodhi-checkpoint.qcow2"
-              PARTS="$DIR/checkpoint-parts"
+              shopt -s nullglob
+              FILES=(checkpoint-parts/bodhi-checkpoint-*.part)
 
-              rm -rf "$PARTS"
-              mkdir -p "$PARTS"
-              rm -f "$BACKUP"
-
-              echo "Compactando disco para o checkpoint..."
-              if qemu-img convert -c -O qcow2 "$DISK" "$BACKUP"; then
-                split -b 1800M -d -a 4 \
-                  --additional-suffix=.part \
-                  "$BACKUP" "$PARTS/bodhi-checkpoint-"
-
-                rm -f "$BACKUP"
-
-                shopt -s nullglob
-                FILES=("$PARTS"/bodhi-checkpoint-*.part)
-
-                if [ "${#FILES[@]}" -eq 0 ]; then
-                  echo "ERRO: nenhuma parte do backup foi criada."
-                  SAVE_OK=0
+              if [ "${#FILES[@]}" -gt 0 ]; then
+                TAG="bodhi-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+                if gh release create "$TAG" "${FILES[@]}" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --title "Bodhi Checkpoint ${GITHUB_RUN_ID}" \
+                  --notes "Checkpoint automatico ExtNoBrasil"; then
+                  echo "Checkpoint enviado: $TAG"
                 else
-                  TAG="bodhi-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-                  if gh release create "$TAG" \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --draft \
-                    --title "Bodhi Checkpoint ${GITHUB_RUN_ID}" \
-                    --notes "Checkpoint automatico ExtNoBrasil PC Gamer"; then
-
-                    if gh release upload "$TAG" "${FILES[@]}" \
-                      --repo "$GITHUB_REPOSITORY"; then
-
-                      RELEASE_ID="$(gh api \
-                        "repos/${GITHUB_REPOSITORY}/releases" \
-                        --paginate \
-                        --jq ".[] | select(.tag_name == \"$TAG\") | .id" |
-                        head -n 1)"
-
-                      if [ -n "$RELEASE_ID" ] &&
-                        gh api \
-                          "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-                          -X PATCH -F draft=false >/dev/null; then
-                        echo "Checkpoint publicado: $TAG"
-                      else
-                        echo "ERRO: nao foi possivel publicar o checkpoint."
-                        SAVE_OK=0
-                      fi
-                    else
-                      echo "ERRO: falha no upload das partes."
-                      SAVE_OK=0
-                    fi
-                  else
-                    echo "ERRO: falha ao criar a Release."
-                    SAVE_OK=0
-                  fi
+                  echo "ERRO: falha ao enviar checkpoint."
+                  RC=1
                 fi
               else
-                echo "ERRO: falha ao compactar o disco."
-                SAVE_OK=0
+                echo "ERRO: nenhuma parte do checkpoint foi criada."
+                RC=1
               fi
 
-              rm -rf "$PARTS"
-              rm -f "$BACKUP"
-            fi
-
-            if [ "$SAVE_OK" -eq 1 ]; then
-              echo "Checkpoint salvo e verificado."
+              rm -rf checkpoint-parts checkpoint.qcow2
             else
-              echo "ATENCAO: nao foi possivel confirmar o checkpoint."
-              [ "$EXIT_CODE" -ne 0 ] || EXIT_CODE=1
+              echo "ERRO: disco ausente ou inconsistente; backup ignorado."
+              RC=1
             fi
 
-            exit "$EXIT_CODE"
+            exit "$RC"
           }
 
           trap cleanup EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
-          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             ACCEL=(-enable-kvm)
             CPU=host
-            echo "Aceleracao KVM disponivel."
           else
             ACCEL=(-accel tcg,thread=multi)
             CPU=max
-            echo "Aviso: emulacao por software, desempenho limitado."
+            echo "Aviso: emulacao por software, pode ficar lenta."
           fi
 
-          case "$BOOT_MODE" in
-            installer) BOOT=(-boot order=d,menu=on) ;;
-            disk)      BOOT=(-boot order=c,menu=on) ;;
-            *)
-              echo "Modo de boot invalido."
-              exit 1
-              ;;
-          esac
+          if [ "$BOOT_MODE" = "installer" ]; then
+            BOOT=(-boot order=d,menu=on)
+          else
+            BOOT=(-boot order=c,menu=on)
+          fi
 
-          rm -f "$MONITOR" "$QEMU_LOG"
+          rm -f "$MON" "$QLOG"
 
           qemu-system-x86_64 \
             "${ACCEL[@]}" \
-            -machine pc \
-            -cpu "$CPU" \
-            -smp 2 \
-            -m 4096 \
-            -drive "file=$DISK,format=qcow2,if=ide" \
-            -cdrom "$ISO" \
+            -machine pc -cpu "$CPU" \
+            -smp 2 -m 4096 \
+            -drive file=bodhi.qcow2,format=qcow2,if=ide \
+            -cdrom bodhi.iso \
             "${BOOT[@]}" \
-            -vga std \
-            -usb \
-            -device usb-tablet \
-            -rtc base=utc \
-            -display none \
+            -vga std -usb -device usb-tablet \
+            -rtc base=utc -display none \
             -vnc 127.0.0.1:1,password=on \
-            -monitor unix:"$MONITOR",server,nowait \
-            > "$QEMU_LOG" 2>&1 &
+            -monitor unix:"$MON",server,nowait \
+            > "$QLOG" 2>&1 &
 
-          QEMU_PID=$!
+          QPID=$!
 
-          for i in $(seq 1 40); do
-            [ -S "$MONITOR" ] && break
-            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              cat "$QEMU_LOG"
+          for i in $(seq 1 30); do
+            [ -S "$MON" ] && break
+            kill -0 "$QPID" 2>/dev/null || {
+              cat "$QLOG"
               exit 1
-            fi
+            }
             sleep 2
           done
 
-          if [ ! -S "$MONITOR" ]; then
-            echo "QEMU nao criou o monitor."
-            cat "$QEMU_LOG"
+          [ -S "$MON" ] || {
+            echo "Monitor QEMU nao iniciou."
+            cat "$QLOG"
             exit 1
-          fi
+          }
 
           printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-            socat -T 5 - UNIX-CONNECT:"$MONITOR" \
-            >/dev/null 2>&1 || true
+            socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1
 
           websockify --web=/usr/share/novnc \
-            6080 127.0.0.1:5901 \
-            > "$VNC_LOG" 2>&1 &
-          WEBSOCKIFY_PID=$!
+            6080 127.0.0.1:5901 > "$BLOG" 2>&1 &
+          WPID=$!
 
-          sleep 3
-          if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
-            cat "$VNC_LOG"
-            exit 1
-          fi
-
+          # Link para navegador: noVNC.
           curl -fsSL \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /tmp/cloudflared
@@ -445,52 +281,64 @@ jobs:
 
           /tmp/cloudflared tunnel \
             --url http://127.0.0.1:6080 \
-            --no-autoupdate \
-            > "$TUNNEL_LOG" 2>&1 &
-          CLOUDFLARED_PID=$!
+            --no-autoupdate > "$CLOG" 2>&1 &
+          CPID=$!
 
-          URL=""
+          WEB_URL=""
           for i in $(seq 1 60); do
-            URL="$(grep -Eo \
+            WEB_URL="$(grep -Eo \
               'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              "$TUNNEL_LOG" | head -n 1 || true)"
-            [ -n "$URL" ] && break
-            kill -0 "$CLOUDFLARED_PID" 2>/dev/null || break
+              "$CLOG" | head -n 1 || true)"
+            [ -n "$WEB_URL" ] && break
             sleep 2
           done
 
-          if [ -z "$URL" ]; then
-            echo "Nao foi possivel obter o link Cloudflare."
-            cat "$TUNNEL_LOG"
-            exit 1
-          fi
+          # Túnel TCP temporário para o bVNC.
+          # O Pinggy pode limitar ou alterar o serviço gratuito.
+          ssh -p 443 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 \
+            -o ExitOnForwardFailure=yes \
+            -R0:localhost:5901 \
+            tcp@a.pinggy.io > "$PLOG" 2>&1 &
+          PPID_TUNNEL=$!
+
+          TCP_URL=""
+          for i in $(seq 1 60); do
+            TCP_URL="$(grep -Eo \
+              'tcp://[^[:space:]]+' "$PLOG" | head -n 1 || true)"
+            [ -n "$TCP_URL" ] && break
+            sleep 2
+          done
 
           echo
-          echo "========================================"
-          echo " EXT NOBRASIL PC GAMER - BODHI LINUX"
-          echo "========================================"
-          echo "Visual: preto e vermelho"
-          echo "Papel de parede: ExtNoBrasil PC Gamer"
+          echo "===== EXT NOBRASIL PC GAMER ====="
+          echo "Sistema: Bodhi Linux"
           echo "Disco virtual: 145 GB"
           echo "RAM configurada: 4 GB"
-          echo "Nucleos virtuais: 2"
           echo "Modo: $BOOT_MODE"
-          echo "Acesso pelo celular:"
-          echo "${URL}/vnc.html?autoconnect=true&resize=scale"
-          echo "Senha VNC: a informada ao iniciar"
-          echo "Checkpoint: GitHub Releases"
-          echo "========================================"
+          echo "noVNC: ${WEB_URL}/vnc.html?autoconnect=true&resize=scale"
+
+          if [ -n "$TCP_URL" ]; then
+            echo "Endereco TCP para bVNC: $TCP_URL"
+            echo "Use o host e a porta exibidos acima no bVNC."
+          else
+            echo "ATENCAO: nao foi possivel obter o endereco TCP."
+            echo "Log Pinggy:"
+            cat "$PLOG"
+          fi
+
+          echo "Senha VNC: a senha informada ao iniciar"
+          echo "Mantenha esta execucao ativa durante o uso."
+          echo "================================="
 
           START=$SECONDS
-          LIMIT=18000
-
-          while kill -0 "$QEMU_PID" 2>/dev/null; do
-            if (( SECONDS - START >= LIMIT )); then
-              echo "Tempo de sessao atingido; encerrando para salvar."
+          while kill -0 "$QPID" 2>/dev/null; do
+            if (( SECONDS - START >= 18000 )); then
+              echo "Limite de sessao atingido."
               break
             fi
             sleep 5
           done
-
-          echo "Finalizando a sessao."
           
