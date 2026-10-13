@@ -1,11 +1,11 @@
 
-name: ExtNoBrasil PC Gamer - bVNC
+name: ExtNoBrasil PC Gamer - bVNC sem Tailscale
 
 on:
   workflow_dispatch:
     inputs:
       rdp_password:
-        description: "Senha que você vai usar no bVNC"
+        description: "Senha do bVNC (8 a 64 caracteres)"
         required: true
         type: string
 
@@ -18,22 +18,17 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Configurar acesso remoto
+      - name: Configurar RDP e túnel
         shell: powershell
         env:
           RDP_PASSWORD: ${{ inputs.rdp_password }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ($env:RDP_PASSWORD.Length -lt 12) {
-            throw "A senha precisa ter pelo menos 12 caracteres."
-          }
-
-          if ($env:RDP_PASSWORD -notmatch '[A-Z]' -or
-              $env:RDP_PASSWORD -notmatch '[a-z]' -or
-              $env:RDP_PASSWORD -notmatch '\d' -or
-              $env:RDP_PASSWORD -notmatch '[^a-zA-Z0-9]') {
-            throw "Use letras maiúsculas, minúsculas, números e símbolos na senha."
+          # Validar a senha
+          if ($env:RDP_PASSWORD.Length -lt 8 -or
+              $env:RDP_PASSWORD.Length -gt 64) {
+            throw "A senha deve ter entre 8 e 64 caracteres."
           }
 
           Write-Output "::add-mask::$env:RDP_PASSWORD"
@@ -43,12 +38,11 @@ jobs:
             -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0
 
-          # Manter a autenticação de nível de rede ativada
           Set-ItemProperty `
             -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication -Value 1
 
-          # Criar usuário local
+          # Criar ou atualizar o usuário Skyro
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
@@ -66,30 +60,29 @@ jobs:
           Add-LocalGroupMember -Group 'Remote Desktop Users' `
             -Member 'Skyro' -ErrorAction SilentlyContinue
 
-          # Liberar RDP no firewall do Windows
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
 
-          # Confirmar que a porta local está escutando
+          # Aguardar a porta local do RDP
           $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 2
-            $test = Test-NetConnection 127.0.0.1 `
-              -Port 3389 -WarningAction SilentlyContinue
-            if ($test.TcpTestSucceeded) {
+            if (Test-NetConnection 127.0.0.1 -Port 3389 `
+                -WarningAction SilentlyContinue |
+                Select-Object -ExpandProperty TcpTestSucceeded) {
               $ready = $true
               break
             }
           }
 
           if (-not $ready) {
-            throw "O RDP não abriu a porta local 3389."
+            throw "O serviço RDP não abriu a porta 3389."
           }
 
-          # Verificar cliente SSH
+          # Verificar o SSH
           $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+
           if (-not $ssh) {
             Add-WindowsCapability -Online `
               -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
@@ -100,10 +93,10 @@ jobs:
             throw "Não foi possível instalar o cliente SSH."
           }
 
-          # Iniciar túnel TCP temporário
+          # Iniciar o túnel Pinggy
           $outFile = Join-Path $env:TEMP 'pinggy-out.txt'
           $errFile = Join-Path $env:TEMP 'pinggy-err.txt'
-          Remove-Item $outFile,$errFile -Force `
+          Remove-Item $outFile, $errFile -Force `
             -ErrorAction SilentlyContinue
 
           $sshArgs = @(
@@ -126,9 +119,10 @@ jobs:
           $server = $null
           $port = $null
 
-          # Aguardar o endereço real fornecido pelo túnel
+          # Esperar pelo endereço real
           for ($i = 0; $i -lt 90; $i++) {
             Start-Sleep -Seconds 2
+            $tunnel.Refresh()
 
             if ($tunnel.HasExited) {
               break
@@ -159,19 +153,21 @@ jobs:
           if (-not $server -or -not $port) {
             Stop-Process -Id $tunnel.Id -Force `
               -ErrorAction SilentlyContinue
-            throw "O túnel não forneceu servidor e porta. Consulte o erro do SSH."
+            throw "O túnel não forneceu servidor e porta. O serviço Pinggy pode estar indisponível ou exigir configuração adicional."
           }
 
-          # Mostrar somente os dois campos solicitados
+          # Exibir somente servidor e porta
           Write-Output ""
           Write-Output "Servidor: $server"
           Write-Output "Porta: $port"
 
-          # Manter a sessão ativa enquanto o túnel estiver conectado
-          while (-not $tunnel.HasExited) {
+          # Manter a sessão ativa
+          while ($true) {
             Start-Sleep -Seconds 15
             $tunnel.Refresh()
-          }
 
-          throw "A conexão do túnel foi encerrada."
+            if ($tunnel.HasExited) {
+              throw "O túnel foi desconectado."
+            }
+          }
           
