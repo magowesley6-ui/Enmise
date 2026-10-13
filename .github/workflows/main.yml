@@ -1,15 +1,19 @@
 
-name: ExtNoBrasil PC Gamer - Bodhi Linux + bVNC
+name: ExtNoBrasil PC Gamer - Windows 11 Dark
 
 on:
   workflow_dispatch:
     inputs:
+      windows_iso_url:
+        description: "Link direto para a ISO oficial do Windows 11 x64"
+        required: true
+        type: string
       vnc_password:
-        description: "Senha VNC exclusiva, de 6 a 8 caracteres"
+        description: "Senha VNC: 6 a 8 letras ou números"
         required: true
         type: string
       boot_mode:
-        description: "Primeira vez: installer; depois: disk"
+        description: "Escolha installer na primeira execução"
         required: true
         type: choice
         default: installer
@@ -21,7 +25,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: extnobrasil-bodhi-pc
+  group: extnobrasil-windows11
   cancel-in-progress: false
 
 jobs:
@@ -30,44 +34,19 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Instalar dependencias
+      - name: Instalar dependências
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            qemu-system-x86 qemu-utils \
+            qemu-system-x86 qemu-utils ovmf \
             novnc websockify socat curl wget \
-            ca-certificates jq openssh-client python3-pil
+            ca-certificates openssh-client gh
 
           mkdir -p "$HOME/virtual-pc"
 
-      - name: Criar papel de parede ExtNoBrasil
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          python3 - "$HOME/virtual-pc/wallpaper.png" <<'PY'
-          from PIL import Image, ImageDraw, ImageFont
-          import sys
-          im = Image.new("RGB", (1280, 720), (5, 0, 3))
-          d = ImageDraw.Draw(im)
-          d.polygon([(900,0),(1280,0),(1280,720),(1080,720)],
-                    fill=(55,0,8))
-          d.line((0,650,800,0), fill=(190,0,20), width=4)
-          d.line((300,720,1100,0), fill=(90,0,10), width=3)
-          bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          f1 = ImageFont.truetype(bold, 72)
-          f2 = ImageFont.truetype(bold, 42)
-          d.text((640,280), "ExtNoBrasil", font=f1,
-                 fill=(255,25,45), anchor="mm")
-          d.text((640,370), "PC GAMER", font=f2,
-                 fill=(245,245,245), anchor="mm")
-          d.text((640,430), "BODHI LINUX | CUSTOM EDITION",
-                 fill=(190,190,190), anchor="mm")
-          im.save(sys.argv[1])
-          PY
-
-      - name: Restaurar ultimo checkpoint
+      - name: Restaurar checkpoint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -81,83 +60,95 @@ jobs:
             --json tagName,publishedAt,isDraft \
             --jq '[.[] |
               select(.isDraft == false) |
-              select(.tagName | startswith("bodhi-checkpoint-"))] |
+              select(.tagName | startswith("win11-checkpoint-"))] |
               sort_by(.publishedAt) | last | .tagName // empty')"
 
           if [ -n "$TAG" ]; then
-            echo "Restaurando $TAG"
             mkdir -p parts
             gh release download "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --pattern 'bodhi-checkpoint-*.part' \
+              --pattern 'win11-checkpoint-*.part' \
               --dir parts
 
             shopt -s nullglob
-            FILES=(parts/bodhi-checkpoint-*.part)
+            FILES=(parts/win11-checkpoint-*.part)
             if [ "${#FILES[@]}" -eq 0 ]; then
-              echo "ERRO: checkpoint sem arquivos."
+              echo "Checkpoint sem arquivos."
               exit 1
             fi
 
-            cat "${FILES[@]}" > bodhi-restored.qcow2
-            qemu-img check bodhi-restored.qcow2
-            mv bodhi-restored.qcow2 bodhi.qcow2
+            cat "${FILES[@]}" > restored.qcow2
+            qemu-img check restored.qcow2
+            mv restored.qcow2 windows11.qcow2
             rm -rf parts
-            echo "Checkpoint restaurado."
+            echo "Disco restaurado."
           else
-            echo "Nenhum checkpoint anterior."
+            echo "Nenhum checkpoint anterior encontrado."
           fi
 
       - name: Baixar ISO e preparar disco
+        env:
+          WINDOWS_ISO_URL: ${{ inputs.windows_iso_url }}
         shell: bash
         run: |
           set -Eeuo pipefail
           cd "$HOME/virtual-pc"
 
-          if [ ! -s bodhi.qcow2 ]; then
-            qemu-img create -f qcow2 bodhi.qcow2 145G
+          if [ ! -s windows11.qcow2 ]; then
+            qemu-img create -f qcow2 windows11.qcow2 145G
           fi
 
-          if [ ! -s bodhi.iso ]; then
-            wget -O bodhi.iso \
-              "https://sourceforge.net/projects/bodhilinux/files/7.0.0/bodhi-7.0.0-64.iso/download"
+          if [ ! -s windows11.iso ]; then
+            case "$WINDOWS_ISO_URL" in
+              https://*) ;;
+              *)
+                echo "Use um link HTTPS direto para a ISO."
+                exit 1
+                ;;
+            esac
+
+            curl -fL --retry 3 \
+              "$WINDOWS_ISO_URL" \
+              -o windows11.iso
           fi
 
-          test -s bodhi.iso
-          qemu-img info bodhi.qcow2
+          test -s windows11.iso
+          qemu-img info windows11.qcow2
+          ls -lh windows11.iso
 
-      - name: Iniciar Bodhi, noVNC e tunel TCP
+      - name: Iniciar Windows 11 e acessos remotos
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
           BOOT_MODE: ${{ inputs.boot_mode }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -Eeuo pipefail
+          cd "$HOME/virtual-pc"
 
           if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
-            echo "A senha deve ter de 6 a 8 letras ou numeros."
+            echo "A senha deve ter de 6 a 8 letras ou números."
             exit 1
           fi
           echo "::add-mask::$VNC_PASSWORD"
 
-          cd "$HOME/virtual-pc"
-          MON=/tmp/bodhi-monitor.sock
-          QLOG=/tmp/bodhi-qemu.log
-          BLOG=/tmp/bodhi-websockify.log
-          CLOG=/tmp/bodhi-cloudflared.log
-          PLOG=/tmp/bodhi-pinggy.log
+          MON=/tmp/win11-monitor.sock
+          QLOG=/tmp/win11-qemu.log
+          BLOG=/tmp/win11-websockify.log
+          CLOG=/tmp/win11-cloudflare.log
+          PLOG=/tmp/win11-pinggy.log
 
           QPID=""
           WPID=""
           CPID=""
-          PPID_TUNNEL=""
+          TPID=""
 
           cleanup() {
             RC=$?
             trap - EXIT INT TERM
             set +e
 
-            echo "Encerrando serviços..."
+            echo "Encerrando a máquina virtual..."
 
             if [ -S "$MON" ]; then
               printf 'system_powerdown\n' |
@@ -173,42 +164,44 @@ jobs:
               wait "$QPID" 2>/dev/null
             fi
 
-            for PID in "$PPID_TUNNEL" "$CPID" "$WPID"; do
+            for PID in "$TPID" "$CPID" "$WPID"; do
               [ -n "$PID" ] && kill "$PID" 2>/dev/null
             done
 
-            if [ -s bodhi.qcow2 ] && qemu-img check bodhi.qcow2; then
-              echo "Compactando checkpoint..."
-              qemu-img convert -c -O qcow2 \
-                bodhi.qcow2 checkpoint.qcow2
+            if [ -s windows11.qcow2 ] &&
+               qemu-img check windows11.qcow2; then
+              echo "Criando checkpoint do disco..."
+              if qemu-img convert -c -O qcow2 \
+                windows11.qcow2 checkpoint.qcow2; then
+                mkdir -p checkpoint-parts
+                split -b 1800M -d -a 4 \
+                  --additional-suffix=.part \
+                  checkpoint.qcow2 \
+                  checkpoint-parts/win11-checkpoint-
 
-              mkdir -p checkpoint-parts
-              split -b 1800M -d -a 4 \
-                --additional-suffix=.part \
-                checkpoint.qcow2 checkpoint-parts/bodhi-checkpoint-
+                shopt -s nullglob
+                FILES=(checkpoint-parts/win11-checkpoint-*.part)
 
-              shopt -s nullglob
-              FILES=(checkpoint-parts/bodhi-checkpoint-*.part)
+                if [ "${#FILES[@]}" -gt 0 ]; then
+                  TAG="win11-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-              if [ "${#FILES[@]}" -gt 0 ]; then
-                TAG="bodhi-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-                if gh release create "$TAG" "${FILES[@]}" \
-                  --repo "$GITHUB_REPOSITORY" \
-                  --title "Bodhi Checkpoint ${GITHUB_RUN_ID}" \
-                  --notes "Checkpoint automatico ExtNoBrasil"; then
-                  echo "Checkpoint enviado: $TAG"
+                  gh release create "$TAG" "${FILES[@]}" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --title "Windows 11 Checkpoint ${GITHUB_RUN_ID}" \
+                    --notes "Checkpoint do ExtNoBrasil PC Gamer" ||
+                    RC=1
                 else
-                  echo "ERRO: falha ao enviar checkpoint."
+                  echo "Nenhuma parte do checkpoint foi criada."
                   RC=1
                 fi
+
+                rm -rf checkpoint-parts checkpoint.qcow2
               else
-                echo "ERRO: nenhuma parte do checkpoint foi criada."
+                echo "Falha ao compactar o disco."
                 RC=1
               fi
-
-              rm -rf checkpoint-parts checkpoint.qcow2
             else
-              echo "ERRO: disco ausente ou inconsistente; backup ignorado."
+              echo "Disco inválido; checkpoint ignorado."
               RC=1
             fi
 
@@ -219,13 +212,15 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
+          # KVM oferece aceleração de CPU quando disponível.
           if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             ACCEL=(-enable-kvm)
             CPU=host
+            echo "Aceleração KVM disponível."
           else
             ACCEL=(-accel tcg,thread=multi)
             CPU=max
-            echo "Aviso: emulacao por software, pode ficar lenta."
+            echo "AVISO: sem KVM; o Windows pode ficar muito lento."
           fi
 
           if [ "$BOOT_MODE" = "installer" ]; then
@@ -234,17 +229,42 @@ jobs:
             BOOT=(-boot order=c,menu=on)
           fi
 
+          # Firmware UEFI para inicialização do Windows.
+          OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+          OVMF_VARS_TEMPLATE=/usr/share/OVMF/OVMF_VARS_4M.fd
+
+          if [ ! -f "$OVMF_CODE" ]; then
+            OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd
+            OVMF_VARS_TEMPLATE=/usr/share/OVMF/OVMF_VARS.fd
+          fi
+
+          if [ ! -f "$OVMF_CODE" ] ||
+             [ ! -f "$OVMF_VARS_TEMPLATE" ]; then
+            echo "Firmware OVMF não encontrado."
+            exit 1
+          fi
+
+          if [ ! -s windows11-vars.fd ]; then
+            cp "$OVMF_VARS_TEMPLATE" windows11-vars.fd
+          fi
+
           rm -f "$MON" "$QLOG"
 
           qemu-system-x86_64 \
             "${ACCEL[@]}" \
-            -machine pc -cpu "$CPU" \
-            -smp 2 -m 4096 \
-            -drive file=bodhi.qcow2,format=qcow2,if=ide \
-            -cdrom bodhi.iso \
+            -machine q35 \
+            -cpu "$CPU" \
+            -smp 4 \
+            -m 6144 \
+            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+            -drive if=pflash,format=raw,file=windows11-vars.fd \
+            -drive file=windows11.qcow2,format=qcow2,if=ide \
+            -drive file=windows11.iso,media=cdrom,readonly=on \
             "${BOOT[@]}" \
-            -vga std -usb -device usb-tablet \
-            -rtc base=utc -display none \
+            -vga std \
+            -usb -device usb-tablet \
+            -rtc base=utc \
+            -display none \
             -vnc 127.0.0.1:1,password=on \
             -monitor unix:"$MON",server,nowait \
             > "$QLOG" 2>&1 &
@@ -261,19 +281,17 @@ jobs:
           done
 
           [ -S "$MON" ] || {
-            echo "Monitor QEMU nao iniciou."
             cat "$QLOG"
             exit 1
           }
 
           printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-            socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1
+            socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1 || true
 
           websockify --web=/usr/share/novnc \
             6080 127.0.0.1:5901 > "$BLOG" 2>&1 &
           WPID=$!
 
-          # Link para navegador: noVNC.
           curl -fsSL \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /tmp/cloudflared
@@ -293,8 +311,6 @@ jobs:
             sleep 2
           done
 
-          # Túnel TCP temporário para o bVNC.
-          # O Pinggy pode limitar ou alterar o serviço gratuito.
           ssh -p 443 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
@@ -302,7 +318,7 @@ jobs:
             -o ExitOnForwardFailure=yes \
             -R0:localhost:5901 \
             tcp@a.pinggy.io > "$PLOG" 2>&1 &
-          PPID_TUNNEL=$!
+          TPID=$!
 
           TCP_URL=""
           for i in $(seq 1 60); do
@@ -313,30 +329,34 @@ jobs:
           done
 
           echo
-          echo "===== EXT NOBRASIL PC GAMER ====="
-          echo "Sistema: Bodhi Linux"
-          echo "Disco virtual: 145 GB"
-          echo "RAM configurada: 4 GB"
+          echo "=========================================="
+          echo " EXT NOBRASIL PC GAMER - WINDOWS 11"
+          echo "=========================================="
+          echo "RAM configurada: 6 GB"
+          echo "CPU virtual: 4 vCPU"
+          echo "Disco virtual máximo: 145 GB"
           echo "Modo: $BOOT_MODE"
           echo "noVNC: ${WEB_URL}/vnc.html?autoconnect=true&resize=scale"
+          echo "Tema Dark e debloat: não aplicados automaticamente."
+          echo "Instale o Windows e configure-o após a instalação."
 
           if [ -n "$TCP_URL" ]; then
-            echo "Endereco TCP para bVNC: $TCP_URL"
-            echo "Use o host e a porta exibidos acima no bVNC."
+            echo "Endereço bVNC: $TCP_URL"
+            echo "No bVNC, separe host e porta do endereço."
           else
-            echo "ATENCAO: nao foi possivel obter o endereco TCP."
-            echo "Log Pinggy:"
+            echo "Túnel bVNC indisponível nesta execução."
             cat "$PLOG"
           fi
 
-          echo "Senha VNC: a senha informada ao iniciar"
-          echo "Mantenha esta execucao ativa durante o uso."
-          echo "================================="
+          echo "Senha VNC: a senha informada ao iniciar."
+          echo "Mantenha esta execução ativa."
+          echo "FPS do Roblox Studio não garantidos."
+          echo "=========================================="
 
           START=$SECONDS
           while kill -0 "$QPID" 2>/dev/null; do
             if (( SECONDS - START >= 18000 )); then
-              echo "Limite de sessao atingido."
+              echo "Limite de sessão atingido."
               break
             fi
             sleep 5
