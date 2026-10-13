@@ -1,143 +1,177 @@
-name: ExtNoBrasil PC Gamer - Windows 11
+
+name: ExtNoBrasil PC Gamer - bVNC
 
 on:
   workflow_dispatch:
     inputs:
-      vnc_password:
-        description: "Senha VNC de 6 a 8 caracteres"
+      rdp_password:
+        description: "Senha que você vai usar no bVNC"
         required: true
         type: string
-        default: "ExT2026"
 
 permissions:
   contents: read
 
 jobs:
   pc-virtual:
-    runs-on: ubuntu-24.04
+    runs-on: windows-latest
     timeout-minutes: 350
 
     steps:
-      - name: Instalar componentes
-        run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 qemu-utils ovmf \
-            novnc websockify socat curl wget \
-            ca-certificates
-
-      - name: Preparar disco e ISO
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "$HOME/virtual-pc"
-          cd "$HOME/virtual-pc"
-
-          # A ISO precisa ser fornecida por uma fonte válida.
-          # Não usar páginas HTML como se fossem arquivos ISO.
-          echo "Tentando localizar uma ISO oficial..."
-          echo "Se não houver URL direta disponível, a execução será interrompida."
-          echo "Consulte: https://www.microsoft.com/software-download/windows11"
-
-          if [ ! -s windows11.iso ]; then
-            echo "::error::A Microsoft não fornece um endereço de ISO permanente garantido para automação. É necessário obter uma URL direta válida ou disponibilizar a ISO."
-            exit 1
-          fi
-
-          if [ ! -f windows11.qcow2 ]; then
-            qemu-img create -f qcow2 windows11.qcow2 80G
-          fi
-
-      - name: Iniciar Windows no QEMU
+      - name: Configurar acesso remoto
+        shell: powershell
         env:
-          VNC_PASSWORD: ${{ inputs.vnc_password }}
+          RDP_PASSWORD: ${{ inputs.rdp_password }}
         run: |
-          set -Eeuo pipefail
-          cd "$HOME/virtual-pc"
+          $ErrorActionPreference = "Stop"
 
-          if [ "${#VNC_PASSWORD}" -lt 6 ] ||
-             [ "${#VNC_PASSWORD}" -gt 8 ]; then
-            echo "::error::A senha precisa ter de 6 a 8 caracteres."
-            exit 1
-          fi
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "A senha precisa ter pelo menos 12 caracteres."
+          }
 
-          # O acelerador KVM é usado quando disponível.
-          # Em TCG, o desempenho pode ser muito baixo.
-          ACCEL=tcg
-          if [ -e /dev/kvm ]; then
-            ACCEL=kvm
-          fi
+          if ($env:RDP_PASSWORD -notmatch '[A-Z]' -or
+              $env:RDP_PASSWORD -notmatch '[a-z]' -or
+              $env:RDP_PASSWORD -notmatch '\d' -or
+              $env:RDP_PASSWORD -notmatch '[^a-zA-Z0-9]') {
+            throw "Use letras maiúsculas, minúsculas, números e símbolos na senha."
+          }
 
-          qemu-system-x86_64 \
-            -name "ExtNoBrasil PC Gamer" \
-            -machine "q35,accel=$ACCEL" \
-            -cpu max \
-            -smp 4 \
-            -m 6G \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-            -drive file=windows11.qcow2,format=qcow2 \
-            -cdrom windows11.iso \
-            -boot order=d \
-            -vga std \
-            -device usb-tablet \
-            -netdev user,id=net0 \
-            -device e1000,netdev=net0 \
-            -monitor unix:"$HOME/qemu-monitor.sock",server,nowait \
-            -vnc 127.0.0.1:0,password=on \
-            -daemonize
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
 
-          sleep 3
-          printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-            socat - UNIX-CONNECT:"$HOME/qemu-monitor.sock"
+          # Ativar Área de Trabalho Remota
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
 
-      - name: Iniciar servidor noVNC
-        run: |
-          set -Eeuo pipefail
+          # Manter a autenticação de nível de rede ativada
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
 
-          websockify \
-            --web=/usr/share/novnc \
-            6080 127.0.0.1:5900 \
-            > "$HOME/novnc.log" 2>&1 &
+          # Criar usuário local
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
 
-          sleep 3
-          curl -fsS http://127.0.0.1:6080/ >/dev/null
+          if (Get-LocalUser -Name 'Skyro' -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name 'Skyro' -Password $securePassword
+          } else {
+            New-LocalUser -Name 'Skyro' `
+              -Password $securePassword `
+              -PasswordNeverExpires
+          }
 
-      - name: Publicar link noVNC
-        run: |
-          set -Eeuo pipefail
+          Add-LocalGroupMember -Group 'Administrators' `
+            -Member 'Skyro' -ErrorAction SilentlyContinue
 
-          wget -q \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -O "$HOME/cloudflared"
-          chmod +x "$HOME/cloudflared"
+          Add-LocalGroupMember -Group 'Remote Desktop Users' `
+            -Member 'Skyro' -ErrorAction SilentlyContinue
 
-          "$HOME/cloudflared" tunnel \
-            --url http://127.0.0.1:6080 \
-            > "$HOME/cloudflared.log" 2>&1 &
+          # Liberar RDP no firewall do Windows
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-          URL=""
-          for i in $(seq 1 60); do
-            URL=$(grep -Eo \
-              'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
-              "$HOME/cloudflared.log" | head -n 1 || true)
-            [ -n "$URL" ] && break
-            sleep 2
-          done
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
 
-          if [ -z "$URL" ]; then
-            cat "$HOME/cloudflared.log"
-            echo "::error::Não foi possível gerar o link noVNC."
-            exit 1
-          fi
+          # Confirmar que a porta local está escutando
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            $test = Test-NetConnection 127.0.0.1 `
+              -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              $ready = $true
+              break
+            }
+          }
 
-          echo "======================================"
-          echo "ExtNoBrasil PC Gamer"
-          echo "Link noVNC: $URL/vnc.html"
-          echo "Senha VNC: a senha informada na execução"
-          echo "======================================"
+          if (-not $ready) {
+            throw "O RDP não abriu a porta local 3389."
+          }
 
-      - name: Manter sessão ativa
-        run: |
-          echo "O PC fica disponível enquanto o job estiver ativo."
-          echo "O disco deste runner não é armazenamento permanente."
-          sleep 18000
+          # Verificar cliente SSH
+          $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+          if (-not $ssh) {
+            Add-WindowsCapability -Online `
+              -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
+            $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+          }
+
+          if (-not $ssh) {
+            throw "Não foi possível instalar o cliente SSH."
+          }
+
+          # Iniciar túnel TCP temporário
+          $outFile = Join-Path $env:TEMP 'pinggy-out.txt'
+          $errFile = Join-Path $env:TEMP 'pinggy-err.txt'
+          Remove-Item $outFile,$errFile -Force `
+            -ErrorAction SilentlyContinue
+
+          $sshArgs = @(
+            '-T'
+            '-o', 'StrictHostKeyChecking=no'
+            '-o', 'ServerAliveInterval=30'
+            '-o', 'ServerAliveCountMax=3'
+            '-p', '443'
+            '-R', '0:localhost:3389'
+            'tcp@a.pinggy.io'
+          )
+
+          $tunnel = Start-Process `
+            -FilePath $ssh.Source `
+            -ArgumentList $sshArgs `
+            -PassThru `
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError $errFile
+
+          $server = $null
+          $port = $null
+
+          # Aguardar o endereço real fornecido pelo túnel
+          for ($i = 0; $i -lt 90; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($tunnel.HasExited) {
+              break
+            }
+
+            $log = ''
+            if (Test-Path $outFile) {
+              $log += Get-Content $outFile -Raw `
+                -ErrorAction SilentlyContinue
+            }
+            if (Test-Path $errFile) {
+              $log += Get-Content $errFile -Raw `
+                -ErrorAction SilentlyContinue
+            }
+
+            $match = [regex]::Match(
+              $log,
+              'tcp://([a-zA-Z0-9.-]+):(\d+)'
+            )
+
+            if ($match.Success) {
+              $server = $match.Groups[1].Value
+              $port = $match.Groups[2].Value
+              break
+            }
+          }
+
+          if (-not $server -or -not $port) {
+            Stop-Process -Id $tunnel.Id -Force `
+              -ErrorAction SilentlyContinue
+            throw "O túnel não forneceu servidor e porta. Consulte o erro do SSH."
+          }
+
+          # Mostrar somente os dois campos solicitados
+          Write-Output ""
+          Write-Output "Servidor: $server"
+          Write-Output "Porta: $port"
+
+          # Manter a sessão ativa enquanto o túnel estiver conectado
+          while (-not $tunnel.HasExited) {
+            Start-Sleep -Seconds 15
+            $tunnel.Refresh()
+          }
+
+          throw "A conexão do túnel foi encerrada."
+          
