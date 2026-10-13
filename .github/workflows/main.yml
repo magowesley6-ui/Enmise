@@ -1,364 +1,142 @@
-
-name: ExtNoBrasil PC Gamer - Windows 11 Dark
+name: ExtNoBrasil PC Gamer - Windows 11
 
 on:
   workflow_dispatch:
     inputs:
-      windows_iso_url:
-        description: "Link direto para a ISO oficial do Windows 11 x64"
-        required: true
-        type: string
       vnc_password:
-        description: "Senha VNC: 6 a 8 letras ou números"
+        description: "Senha VNC (6 a 8 caracteres)"
         required: true
         type: string
-      boot_mode:
-        description: "Escolha installer na primeira execução"
-        required: true
-        type: choice
-        default: installer
-        options:
-          - installer
-          - disk
+        default: "ExT2026"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: extnobrasil-windows11
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  virtual-pc:
+  pc-virtual:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Instalar dependências
-        shell: bash
+      - name: Instalar componentes
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 qemu-utils ovmf \
             novnc websockify socat curl wget \
-            ca-certificates openssh-client gh
+            openssh-client ca-certificates
+
+      - name: Verificar ISO do Windows
+        env:
+          WINDOWS_ISO_URL: ${{ secrets.WINDOWS_ISO_URL }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "${WINDOWS_ISO_URL:-}" ]; then
+            echo "::error::Configure o segredo WINDOWS_ISO_URL com uma URL válida da ISO do Windows 11."
+            exit 1
+          fi
 
           mkdir -p "$HOME/virtual-pc"
-
-      - name: Restaurar checkpoint
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
           cd "$HOME/virtual-pc"
 
-          TAG="$(gh release list \
-            --repo "$GITHUB_REPOSITORY" \
-            --limit 100 \
-            --json tagName,publishedAt,isDraft \
-            --jq '[.[] |
-              select(.isDraft == false) |
-              select(.tagName | startswith("win11-checkpoint-"))] |
-              sort_by(.publishedAt) | last | .tagName // empty')"
-
-          if [ -n "$TAG" ]; then
-            mkdir -p parts
-            gh release download "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern 'win11-checkpoint-*.part' \
-              --dir parts
-
-            shopt -s nullglob
-            FILES=(parts/win11-checkpoint-*.part)
-            if [ "${#FILES[@]}" -eq 0 ]; then
-              echo "Checkpoint sem arquivos."
-              exit 1
-            fi
-
-            cat "${FILES[@]}" > restored.qcow2
-            qemu-img check restored.qcow2
-            mv restored.qcow2 windows11.qcow2
-            rm -rf parts
-            echo "Disco restaurado."
-          else
-            echo "Nenhum checkpoint anterior encontrado."
-          fi
-
-      - name: Baixar ISO e preparar disco
-        env:
-          WINDOWS_ISO_URL: ${{ inputs.windows_iso_url }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$HOME/virtual-pc"
-
-          if [ ! -s windows11.qcow2 ]; then
-            qemu-img create -f qcow2 windows11.qcow2 145G
-          fi
-
-          if [ ! -s windows11.iso ]; then
-            case "$WINDOWS_ISO_URL" in
-              https://*) ;;
-              *)
-                echo "Use um link HTTPS direto para a ISO."
-                exit 1
-                ;;
-            esac
-
+          if [ ! -f windows11.iso ]; then
             curl -fL --retry 3 \
               "$WINDOWS_ISO_URL" \
               -o windows11.iso
           fi
 
-          test -s windows11.iso
-          qemu-img info windows11.qcow2
-          ls -lh windows11.iso
+          qemu-img create -f qcow2 windows11.qcow2 80G
 
-      - name: Iniciar Windows 11 e acessos remotos
+      - name: Iniciar PC virtual
         env:
           VNC_PASSWORD: ${{ inputs.vnc_password }}
-          BOOT_MODE: ${{ inputs.boot_mode }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         run: |
           set -Eeuo pipefail
           cd "$HOME/virtual-pc"
 
-          if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{6,8}$ ]]; then
-            echo "A senha deve ter de 6 a 8 letras ou números."
-            exit 1
-          fi
-          echo "::add-mask::$VNC_PASSWORD"
-
-          MON=/tmp/win11-monitor.sock
-          QLOG=/tmp/win11-qemu.log
-          BLOG=/tmp/win11-websockify.log
-          CLOG=/tmp/win11-cloudflare.log
-          PLOG=/tmp/win11-pinggy.log
-
-          QPID=""
-          WPID=""
-          CPID=""
-          TPID=""
-
-          cleanup() {
-            RC=$?
-            trap - EXIT INT TERM
-            set +e
-
-            echo "Encerrando a máquina virtual..."
-
-            if [ -S "$MON" ]; then
-              printf 'system_powerdown\n' |
-                socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1
-            fi
-
-            if [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
-              sleep 5
-              printf 'quit\n' |
-                socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1
-              sleep 2
-              kill "$QPID" 2>/dev/null
-              wait "$QPID" 2>/dev/null
-            fi
-
-            for PID in "$TPID" "$CPID" "$WPID"; do
-              [ -n "$PID" ] && kill "$PID" 2>/dev/null
-            done
-
-            if [ -s windows11.qcow2 ] &&
-               qemu-img check windows11.qcow2; then
-              echo "Criando checkpoint do disco..."
-              if qemu-img convert -c -O qcow2 \
-                windows11.qcow2 checkpoint.qcow2; then
-                mkdir -p checkpoint-parts
-                split -b 1800M -d -a 4 \
-                  --additional-suffix=.part \
-                  checkpoint.qcow2 \
-                  checkpoint-parts/win11-checkpoint-
-
-                shopt -s nullglob
-                FILES=(checkpoint-parts/win11-checkpoint-*.part)
-
-                if [ "${#FILES[@]}" -gt 0 ]; then
-                  TAG="win11-checkpoint-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-                  gh release create "$TAG" "${FILES[@]}" \
-                    --repo "$GITHUB_REPOSITORY" \
-                    --title "Windows 11 Checkpoint ${GITHUB_RUN_ID}" \
-                    --notes "Checkpoint do ExtNoBrasil PC Gamer" ||
-                    RC=1
-                else
-                  echo "Nenhuma parte do checkpoint foi criada."
-                  RC=1
-                fi
-
-                rm -rf checkpoint-parts checkpoint.qcow2
-              else
-                echo "Falha ao compactar o disco."
-                RC=1
-              fi
-            else
-              echo "Disco inválido; checkpoint ignorado."
-              RC=1
-            fi
-
-            exit "$RC"
-          }
-
-          trap cleanup EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-
-          # KVM oferece aceleração de CPU quando disponível.
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            ACCEL=(-enable-kvm)
-            CPU=host
-            echo "Aceleração KVM disponível."
-          else
-            ACCEL=(-accel tcg,thread=multi)
-            CPU=max
-            echo "AVISO: sem KVM; o Windows pode ficar muito lento."
-          fi
-
-          if [ "$BOOT_MODE" = "installer" ]; then
-            BOOT=(-boot order=d,menu=on)
-          else
-            BOOT=(-boot order=c,menu=on)
-          fi
-
-          # Firmware UEFI para inicialização do Windows.
-          OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-          OVMF_VARS_TEMPLATE=/usr/share/OVMF/OVMF_VARS_4M.fd
-
-          if [ ! -f "$OVMF_CODE" ]; then
-            OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd
-            OVMF_VARS_TEMPLATE=/usr/share/OVMF/OVMF_VARS.fd
-          fi
-
-          if [ ! -f "$OVMF_CODE" ] ||
-             [ ! -f "$OVMF_VARS_TEMPLATE" ]; then
-            echo "Firmware OVMF não encontrado."
-            exit 1
-          fi
-
-          if [ ! -s windows11-vars.fd ]; then
-            cp "$OVMF_VARS_TEMPLATE" windows11-vars.fd
-          fi
-
-          rm -f "$MON" "$QLOG"
-
+          # Inicia o QEMU com UEFI e instalador do Windows.
           qemu-system-x86_64 \
-            "${ACCEL[@]}" \
-            -machine q35 \
-            -cpu "$CPU" \
+            -name "ExtNoBrasil PC Gamer" \
+            -machine q35,accel=kvm:tcg \
+            -cpu max \
             -smp 4 \
-            -m 6144 \
-            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-            -drive if=pflash,format=raw,file=windows11-vars.fd \
-            -drive file=windows11.qcow2,format=qcow2,if=ide \
-            -drive file=windows11.iso,media=cdrom,readonly=on \
-            "${BOOT[@]}" \
+            -m 6G \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive file=windows11.qcow2,format=qcow2,if=virtio \
+            -cdrom windows11.iso \
+            -boot order=d \
             -vga std \
-            -usb -device usb-tablet \
-            -rtc base=utc \
-            -display none \
-            -vnc 127.0.0.1:1,password=on \
-            -monitor unix:"$MON",server,nowait \
-            > "$QLOG" 2>&1 &
+            -device usb-tablet \
+            -netdev user,id=net0 \
+            -device e1000,netdev=net0 \
+            -monitor unix:"$HOME/qemu-monitor.sock",server,nowait \
+            -vnc 127.0.0.1:0,password=on \
+            -daemonize
 
-          QPID=$!
+          sleep 3
 
-          for i in $(seq 1 30); do
-            [ -S "$MON" ] && break
-            kill -0 "$QPID" 2>/dev/null || {
-              cat "$QLOG"
-              exit 1
-            }
-            sleep 2
-          done
-
-          [ -S "$MON" ] || {
-            cat "$QLOG"
-            exit 1
-          }
-
+          # Define a senha VNC.
           printf 'change vnc password %s\n' "$VNC_PASSWORD" |
-            socat -T 5 - UNIX-CONNECT:"$MON" >/dev/null 2>&1 || true
+            socat - UNIX-CONNECT:"$HOME/qemu-monitor.sock"
 
-          websockify --web=/usr/share/novnc \
-            6080 127.0.0.1:5901 > "$BLOG" 2>&1 &
-          WPID=$!
+      - name: Iniciar noVNC
+        run: |
+          set -Eeuo pipefail
 
-          curl -fsSL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /tmp/cloudflared
-          chmod +x /tmp/cloudflared
+          websockify \
+            --web=/usr/share/novnc \
+            6080 localhost:5900 \
+            > "$HOME/novnc.log" 2>&1 &
 
-          /tmp/cloudflared tunnel \
-            --url http://127.0.0.1:6080 \
-            --no-autoupdate > "$CLOG" 2>&1 &
-          CPID=$!
+          sleep 3
 
-          WEB_URL=""
-          for i in $(seq 1 60); do
-            WEB_URL="$(grep -Eo \
-              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              "$CLOG" | head -n 1 || true)"
-            [ -n "$WEB_URL" ] && break
-            sleep 2
-          done
-
-          ssh -p 443 \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ServerAliveInterval=30 \
-            -o ExitOnForwardFailure=yes \
-            -R0:localhost:5901 \
-            tcp@a.pinggy.io > "$PLOG" 2>&1 &
-          TPID=$!
-
-          TCP_URL=""
-          for i in $(seq 1 60); do
-            TCP_URL="$(grep -Eo \
-              'tcp://[^[:space:]]+' "$PLOG" | head -n 1 || true)"
-            [ -n "$TCP_URL" ] && break
-            sleep 2
-          done
-
-          echo
-          echo "=========================================="
-          echo " EXT NOBRASIL PC GAMER - WINDOWS 11"
-          echo "=========================================="
-          echo "RAM configurada: 6 GB"
-          echo "CPU virtual: 4 vCPU"
-          echo "Disco virtual máximo: 145 GB"
-          echo "Modo: $BOOT_MODE"
-          echo "noVNC: ${WEB_URL}/vnc.html?autoconnect=true&resize=scale"
-          echo "Tema Dark e debloat: não aplicados automaticamente."
-          echo "Instale o Windows e configure-o após a instalação."
-
-          if [ -n "$TCP_URL" ]; then
-            echo "Endereço bVNC: $TCP_URL"
-            echo "No bVNC, separe host e porta do endereço."
-          else
-            echo "Túnel bVNC indisponível nesta execução."
-            cat "$PLOG"
+          if ! curl -fsS http://127.0.0.1:6080/ >/dev/null; then
+            echo "::error::O servidor noVNC não iniciou."
+            cat "$HOME/novnc.log"
+            exit 1
           fi
 
-          echo "Senha VNC: a senha informada ao iniciar."
-          echo "Mantenha esta execução ativa."
-          echo "FPS do Roblox Studio não garantidos."
-          echo "=========================================="
+      - name: Publicar acesso pelo navegador
+        run: |
+          set -Eeuo pipefail
 
-          START=$SECONDS
-          while kill -0 "$QPID" 2>/dev/null; do
-            if (( SECONDS - START >= 18000 )); then
-              echo "Limite de sessão atingido."
+          # O Cloudflare Tunnel exige o executável cloudflared.
+          wget -q \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -O "$HOME/cloudflared"
+
+          chmod +x "$HOME/cloudflared"
+
+          "$HOME/cloudflared" tunnel \
+            --url http://127.0.0.1:6080 \
+            > "$HOME/cloudflared.log" 2>&1 &
+
+          for i in $(seq 1 60); do
+            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+              "$HOME/cloudflared.log" | head -n 1 || true)
+
+            if [ -n "$URL" ]; then
+              echo "======================================"
+              echo "ExtNoBrasil PC Gamer"
+              echo "Acesso pelo navegador: $URL/vnc.html"
+              echo "Senha VNC: configure a senha informada"
+              echo "======================================"
               break
             fi
-            sleep 5
+
+            sleep 2
           done
-          
+
+          if [ -z "${URL:-}" ]; then
+            echo "::error::Não foi possível obter o link noVNC."
+            cat "$HOME/cloudflared.log"
+            exit 1
+          fi
+
+      - name: Manter sessão ativa
+        run: |
+          echo "O PC virtual ficará disponível enquanto o job estiver ativo."
+          echo "O disco não tem backup permanente neste workflow."
+          sleep 18000
