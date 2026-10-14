@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "Senha VNC (6 a 8 caracteres)"
+        description: "Senha VNC (6 a 8 letras ou números)"
         required: true
         type: string
       boot_mode:
-        description: "Modo de inicialização"
+        description: "Inicialização"
         required: true
         type: choice
         options:
@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   virtual-pc:
-    name: Iniciar PC Virtual Garuda KDE
+    name: ExtNoBrasil PC Virtual
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -38,34 +38,22 @@ jobs:
       DISK_SIZE: "80G"
 
     steps:
-      - name: Baixar ferramentas necessárias
+      - name: Instalar dependências
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            zstd \
-            socat \
-            curl \
-            wget \
-            openssh-client \
-            novnc \
-            websockify \
-            ca-certificates \
-            python3
+            qemu-system-x86 qemu-utils zstd socat \
+            curl wget openssh-client ca-certificates python3
 
-      - name: Preparar diretórios
+      - name: Preparar pastas
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$HOME/garuda-save"
-          mkdir -p "$HOME/garuda"
-          echo "GARUDA_DIR=$HOME/garuda" >> "$GITHUB_ENV"
-          echo "SAVE_DIR=$HOME/garuda-save" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/garuda" "$HOME/garuda-save"
 
-      - name: Restaurar checkpoint anterior
+      - name: Restaurar checkpoint
         id: restore
         uses: actions/cache/restore@v4
         with:
@@ -84,45 +72,38 @@ jobs:
           SAVE="$HOME/garuda-save/garuda.qcow2.zst"
 
           if [ -s "$SAVE" ]; then
-            echo "Checkpoint encontrado. Restaurando disco..."
+            echo "Restaurando checkpoint anterior..."
             zstd -d -f "$SAVE" -o "$DISK"
-            echo "RESTORED=true" >> "$GITHUB_ENV"
+            echo "RESTORED=sim" >> "$GITHUB_ENV"
           else
-            echo "Nenhum checkpoint encontrado."
+            echo "Criando disco virtual novo..."
             qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
-            echo "RESTORED=false" >> "$GITHUB_ENV"
+            echo "RESTORED=não" >> "$GITHUB_ENV"
           fi
 
           if [ ! -s "$ISO" ]; then
-            echo "Baixando ISO do Garuda Linux..."
             wget -O "$ISO" \
               "https://sourceforge.net/projects/garuda-linux/files/garuda/dr460nized/260819/garuda-dr460nized-linux-garuda-260819.iso/download"
           fi
 
-          qemu-img info "$DISK"
-
-      - name: Verificar aceleração
+      - name: Detectar aceleração
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             echo "ACCEL=kvm" >> "$GITHUB_ENV"
             echo "CPU_MODEL=host" >> "$GITHUB_ENV"
-            echo "Aceleração KVM disponível."
           else
             echo "ACCEL=tcg,thread=multi" >> "$GITHUB_ENV"
             echo "CPU_MODEL=max" >> "$GITHUB_ENV"
-            echo "KVM indisponível. Usando emulação por software."
           fi
 
-      - name: Iniciar QEMU e corrigir USB
+      - name: Iniciar QEMU com USB corrigido
         shell: bash
         run: |
           set -Eeuo pipefail
 
           cd "$HOME/garuda"
-
           DISK="$HOME/garuda/garuda.qcow2"
           ISO="$HOME/garuda/garuda.iso"
           MONITOR="$HOME/garuda/monitor.sock"
@@ -133,17 +114,22 @@ jobs:
           BOOT_ARGS=()
           if [ "$BOOT_MODE" = "installer" ]; then
             BOOT_ARGS=(-cdrom "$ISO" -boot order=d)
-            echo "Modo: instalador"
           else
             BOOT_ARGS=(-boot order=c)
-            echo "Modo: disco"
           fi
 
+          if [ "${#VNC_PASSWORD}" -lt 6 ] ||
+             [ "${#VNC_PASSWORD}" -gt 8 ] ||
+             [[ ! "$VNC_PASSWORD" =~ ^[a-zA-Z0-9]+$ ]]; then
+            echo "ERRO: use uma senha com 6 a 8 letras ou números."
+            exit 1
+          fi
+
+          echo "Modo: $BOOT_MODE"
           echo "Vídeo virtual: VGA padrão"
-          echo "RAM configurada: ${RAM_MB} MB"
-          echo "CPUs configuradas: ${CPU_COUNT}"
-          echo "Aceleração: ${ACCEL}"
-          echo "Checkpoint restaurado: ${RESTORED}"
+          echo "RAM configurada: $RAM_MB MB"
+          echo "CPUs configuradas: $CPU_COUNT"
+          echo "Aceleração: $ACCEL"
 
           qemu-system-x86_64 \
             -name "ExtNoBrasil PC Gamer" \
@@ -167,7 +153,6 @@ jobs:
 
           QEMU_PID=$!
           echo "$QEMU_PID" > "$HOME/garuda/qemu.pid"
-          echo "QEMU_PID=$QEMU_PID" >> "$GITHUB_ENV"
 
           READY=false
           for i in $(seq 1 60); do
@@ -176,17 +161,15 @@ jobs:
               cat "$LOG" || true
               exit 1
             fi
-
             if [ -S "$MONITOR" ]; then
               READY=true
               break
             fi
-
             sleep 1
           done
 
           if [ "$READY" != "true" ]; then
-            echo "ERRO: monitor do QEMU não ficou disponível."
+            echo "ERRO: monitor QEMU não ficou disponível."
             cat "$LOG" || true
             exit 1
           fi
@@ -194,24 +177,13 @@ jobs:
           export MONITOR VNC_PASSWORD
 
           python3 <<'PY'
-          import os
-          import socket
-          import time
-          import sys
+          import os, socket, time, sys
 
           path = os.environ["MONITOR"]
           password = os.environ["VNC_PASSWORD"]
-
-          if not 6 <= len(password) <= 8:
-              print("ERRO: a senha precisa ter de 6 a 8 caracteres.")
-              sys.exit(1)
-
-          if not password.isalnum():
-              print("ERRO: use somente letras e números na senha.")
-              sys.exit(1)
-
           s = None
-          for attempt in range(60):
+
+          for _ in range(60):
               try:
                   s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                   s.settimeout(5)
@@ -227,26 +199,25 @@ jobs:
               print("ERRO: não foi possível conectar ao monitor QEMU.")
               sys.exit(1)
 
-          def read_until(marker, timeout=10):
+          def read_data(timeout=3):
               s.settimeout(timeout)
               data = b""
-              deadline = time.monotonic() + timeout
-              while time.monotonic() < deadline:
-                  try:
+              try:
+                  while True:
                       chunk = s.recv(4096)
                       if not chunk:
                           break
                       data += chunk
-                      if marker.lower() in data.lower():
+                      if b"(qemu)" in data.lower() or b"password:" in data.lower():
                           break
-                  except socket.timeout:
-                      break
+              except socket.timeout:
+                  pass
               return data
 
           try:
-              read_until(b"(qemu)", 5)
+              read_data()
               s.sendall(b"change vnc password\n")
-              response = read_until(b"password:", 5)
+              response = read_data()
 
               if b"password:" not in response.lower():
                   print("ERRO: QEMU não solicitou a senha VNC.")
@@ -254,145 +225,140 @@ jobs:
                   sys.exit(1)
 
               s.sendall(password.encode() + b"\n")
-              result = read_until(b"(qemu)", 5)
-              print("Comando de senha VNC enviado.")
-              print(result.decode(errors="replace"))
+              print(read_data().decode(errors="replace"))
+              print("Configuração da senha VNC enviada.")
           finally:
               s.close()
           PY
 
-      - name: Iniciar acesso web noVNC
+      - name: Abrir túnel TCP para bVNC
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          # O VNC permanece acessível somente pelo próprio runner.
-          websockify \
-            --web=/usr/share/novnc \
-            6080 \
-            127.0.0.1:5900 \
-            > "$HOME/garuda/novnc.log" 2>&1 &
+          LOG="$HOME/garuda/tunnel.log"
 
-          echo $! > "$HOME/garuda/novnc.pid"
-
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6080/ >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-
-          if ! curl -fsS http://127.0.0.1:6080/ >/dev/null; then
-            echo "ERRO: o servidor noVNC não iniciou."
-            cat "$HOME/garuda/novnc.log" || true
-            exit 1
-          fi
-
-          echo "Servidor noVNC iniciado na porta 6080."
-
-      - name: Abrir túnel remoto
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          # Túnel HTTP para a interface web do noVNC.
-          timeout 340m ssh \
+          # Encaminha a porta TCP pública diretamente para o VNC local.
+          # O endereço e a porta públicos serão fornecidos pelo Pinggy.
+          ssh -T \
             -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=3 \
             -p 443 \
-            -R 0:127.0.0.1:6080 \
-            a.pinggy.io \
-            2>&1 | tee "$HOME/garuda/tunnel.log" &
-          
-          TUNNEL_PID=$!
-          echo "$TUNNEL_PID" > "$HOME/garuda/tunnel.pid"
+            -R 0:127.0.0.1:5900 \
+            tcp@a.pinggy.io \
+            2>&1 | tee "$LOG" &
+          echo $! > "$HOME/garuda/tunnel.pid"
 
-          sleep 8
+          for i in $(seq 1 30); do
+            if grep -Eqi 'tcp://|[a-zA-Z0-9.-]+:[0-9]{4,5}' "$LOG"; then
+              break
+            fi
+            sleep 2
+          done
+
           echo
           echo "=============================================="
           echo " DETALHES DO PC VIRTUAL [BETA]"
           echo " Criador - ExtNoBrasil (ExT)"
           echo " Perfil do Discord - Brasil_kill0"
-          echo " Dia de criação - Sexta-feira 9 de outubro 2026"
           echo "=============================================="
-          echo "Modo: $BOOT_MODE"
-          echo "RAM: ${RAM_MB} MB"
-          echo "CPUs virtuais: ${CPU_COUNT}"
-          echo "Disco virtual: ${DISK_SIZE}"
-          echo "Checkpoint restaurado: ${RESTORED}"
-          echo
-          echo "Procure no log do túnel o endereço HTTPS do Pinggy."
-          echo "Abra esse endereço no Chrome do celular."
-          echo "A senha é a que você informou ao iniciar o workflow."
-          echo "=============================================="
+
+          python3 <<'PY'
+          import re
+          from pathlib import Path
+
+          log = Path.home() / "garuda" / "tunnel.log"
+          content = log.read_text(errors="replace")
+
+          # Tenta reconhecer o endereço TCP público divulgado pelo túnel.
+          matches = re.findall(
+              r'(?:tcp://)?([a-zA-Z0-9.-]+):([0-9]{2,5})',
+              content
+          )
+
+          chosen = None
+          for host, port in matches:
+              if host in ("127.0.0.1", "localhost") or port in ("22", "443"):
+                  continue
+              chosen = (host, port)
+              break
+
+          if chosen:
+              print("Endereço de Servidor:")
+              print(chosen[0])
+              print()
+              print("Porta:")
+              print(chosen[1])
+          else:
+              print("Endereço de Servidor:")
+              print("Confira o log do túnel abaixo.")
+              print()
+              print("Porta:")
+              print("Confira o log do túnel abaixo.")
+
+          print()
+          print("Senha: a senha VNC informada ao iniciar o workflow")
+          print("==============================================")
+          print()
+          print("LOG DO TÚNEL:")
+          print(content[-6000:])
+          PY
 
       - name: Manter sessão ativa
         shell: bash
         run: |
           set -Eeuo pipefail
-
           QEMU_PID="$(cat "$HOME/garuda/qemu.pid")"
-          TUNNEL_PID="$(cat "$HOME/garuda/tunnel.pid")"
 
           while kill -0 "$QEMU_PID" 2>/dev/null; do
-            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-              echo "Aviso: o processo do túnel terminou."
-              break
-            fi
             sleep 15
           done
 
-          echo "A sessão terminou ou um processo foi encerrado."
+          echo "A sessão QEMU terminou."
 
-      - name: Salvar checkpoint
+      - name: Encerrar e salvar checkpoint
         if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          MONITOR="$HOME/garuda/monitor.sock"
           DISK="$HOME/garuda/garuda.qcow2"
           SAVE="$HOME/garuda-save/garuda.qcow2.zst"
 
-          # Encerra QEMU antes de compactar o disco.
-          if [ -S "$HOME/garuda/monitor.sock" ]; then
-            printf 'quit\n' | socat - UNIX-CONNECT:"$HOME/garuda/monitor.sock" \
-              >/dev/null 2>&1 || true
+          if [ -S "$MONITOR" ]; then
+            printf 'quit\n' |
+              socat - UNIX-CONNECT:"$MONITOR" >/dev/null 2>&1 || true
           fi
 
-          if [ -f "$HOME/garuda/qemu.pid" ]; then
-            kill "$(cat "$HOME/garuda/qemu.pid")" 2>/dev/null || true
-          fi
-
-          if [ -f "$HOME/garuda/novnc.pid" ]; then
-            kill "$(cat "$HOME/garuda/novnc.pid")" 2>/dev/null || true
-          fi
-
-          if [ -f "$HOME/garuda/tunnel.pid" ]; then
-            kill "$(cat "$HOME/garuda/tunnel.pid")" 2>/dev/null || true
-          fi
+          for file in qemu.pid tunnel.pid; do
+            if [ -f "$HOME/garuda/$file" ]; then
+              kill "$(cat "$HOME/garuda/$file")" 2>/dev/null || true
+            fi
+          done
 
           sleep 2
 
           if [ ! -s "$DISK" ]; then
-            echo "Não há disco válido para salvar."
+            echo "Disco não encontrado; checkpoint não foi salvo."
             exit 0
           fi
 
-          echo "Compactando disco virtual..."
+          echo "Compactando checkpoint..."
           zstd -T0 -1 -f "$DISK" -o "$SAVE"
 
           SIZE=$(stat -c%s "$SAVE")
           MAX_SIZE=$((9800 * 1024 * 1024))
 
           if [ "$SIZE" -gt "$MAX_SIZE" ]; then
-            echo "Checkpoint excede 9,8 GB; não será salvo no cache."
+            echo "Checkpoint acima de 9,8 GB; não será enviado ao cache."
             rm -f "$SAVE"
             exit 0
           fi
 
-          echo "Checkpoint compactado: $SIZE bytes"
           echo "SAVE_READY=true" >> "$GITHUB_ENV"
+          echo "Checkpoint pronto: $SIZE bytes"
 
       - name: Guardar checkpoint no cache
         if: always() && env.SAVE_READY == 'true'
