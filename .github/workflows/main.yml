@@ -1,12 +1,21 @@
-name: ExtNoBrasil PC Gamer - Garuda KDE bVNC
+
+name: ExtNoBrasil PC Gamer - Garuda KDE bVNC FIX
 
 on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "Senha do bVNC (1 a 8 letras ou números)"
+        description: "Senha VNC: 1 a 8 letras ou números"
         required: true
         type: string
+      boot_mode:
+        description: "Primeira execução: installer. Depois de instalar: disk."
+        required: true
+        type: choice
+        options:
+          - installer
+          - disk
+        default: installer
 
 permissions:
   contents: read
@@ -19,6 +28,7 @@ jobs:
 
     env:
       VNC_PASS: ${{ inputs.vnc_password }}
+      BOOT_MODE: ${{ inputs.boot_mode }}
 
     steps:
       - name: Instalar dependências
@@ -27,7 +37,7 @@ jobs:
           set -Eeuo pipefail
 
           if [[ ! "$VNC_PASS" =~ ^[a-zA-Z0-9]{1,8}$ ]]; then
-            echo "ERRO: a senha deve ter de 1 a 8 letras ou números."
+            echo "ERRO: senha deve conter de 1 a 8 letras ou números."
             exit 1
           fi
 
@@ -38,11 +48,19 @@ jobs:
             qemu-system-x86 qemu-utils \
             curl wget ca-certificates \
             zstd socat openssh-client \
-            netcat-openbsd python3
+            python3
 
-          mkdir -p "$HOME/garuda"
+          mkdir -p "$HOME/garuda" "$HOME/garuda-save"
 
-      - name: Baixar ISO oficial do Garuda KDE
+      - name: Restaurar checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/garuda-save/garuda.qcow2.zst
+          key: garuda-extnobrasil-latest
+          restore-keys: |
+            garuda-extnobrasil-
+
+      - name: Preparar disco e ISO
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -51,85 +69,82 @@ jobs:
 
           ISO_URL="https://sourceforge.net/projects/garuda-linux/files/garuda/dr460nized/260819/garuda-dr460nized-linux-garuda-260819.iso/download"
 
-          echo "Baixando a ISO do Garuda KDE Dr460nized..."
-          curl -fL --retry 3 --retry-delay 5 \
-            "$ISO_URL" -o garuda.iso
-
-          if [ ! -s garuda.iso ]; then
-            echo "ERRO: ISO não foi baixada corretamente."
-            exit 1
-          fi
-
-          echo "ISO baixada:"
-          ls -lh garuda.iso
-
-      - name: Preparar disco virtual
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "$HOME/garuda"
-
-          # Restaura um checkpoint anterior, se houver.
-          mkdir -p "$HOME/garuda-save"
-
-          if [ -f "$HOME/garuda-save/garuda.qcow2.zst" ]; then
+          if [ -s "$HOME/garuda-save/garuda.qcow2.zst" ]; then
+            echo "Checkpoint encontrado. Verificando..."
             zstd -t "$HOME/garuda-save/garuda.qcow2.zst"
-            zstd -d -f \
-              "$HOME/garuda-save/garuda.qcow2.zst" \
-              -o garuda.qcow2
+
+            if [ ! -s garuda.qcow2 ]; then
+              zstd -d -f \
+                "$HOME/garuda-save/garuda.qcow2.zst" \
+                -o garuda.qcow2
+            fi
           fi
 
-          if [ ! -f garuda.qcow2 ]; then
+          if [ ! -s garuda.qcow2 ]; then
             qemu-img create -f qcow2 garuda.qcow2 80G
           fi
 
-          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+          if [ "$BOOT_MODE" = "installer" ]; then
+            echo "Baixando ISO para iniciar o instalador..."
+            curl -fL --retry 3 --retry-delay 5 \
+              "$ISO_URL" -o garuda.iso
+            test -s garuda.iso
+          fi
+
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             echo "ACCEL=kvm" >> "$GITHUB_ENV"
             echo "CPU_MODEL=host" >> "$GITHUB_ENV"
             echo "KVM disponível."
           else
             echo "ACCEL=tcg,thread=multi" >> "$GITHUB_ENV"
             echo "CPU_MODEL=max" >> "$GITHUB_ENV"
-            echo "AVISO: sem KVM, o Garuda poderá ficar muito lento."
+            echo "AVISO: sem KVM, o desempenho será reduzido."
           fi
 
-      - name: Iniciar Garuda e VNC
+      - name: Iniciar Garuda com vídeo compatível
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$HOME/garuda"
 
           RAM_MB=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
           RAM_MB=$((RAM_MB - 1800))
 
-          if [ "$RAM_MB" -gt 8192 ]; then RAM_MB=8192; fi
-          if [ "$RAM_MB" -lt 2048 ]; then RAM_MB=2048; fi
+          (( RAM_MB > 8192 )) && RAM_MB=8192
+          (( RAM_MB < 2048 )) && RAM_MB=2048
 
           CPU_COUNT=$(nproc)
+          (( CPU_COUNT > 4 )) && CPU_COUNT=4
 
-          echo "RAM atribuída: ${RAM_MB} MB"
-          echo "CPUs virtuais: ${CPU_COUNT}"
+          QEMU_ARGS=(
+            -machine pc
+            -accel "$ACCEL"
+            -cpu "$CPU_MODEL"
+            -smp "$CPU_COUNT"
+            -m "${RAM_MB}M"
+            -drive file=garuda.qcow2,if=ide,format=qcow2
+            -vga cirrus
+            -display none
+            -device usb-tablet
+            -netdev user,id=net0
+            -device e1000,netdev=net0
+            -vnc 127.0.0.1:0,password=on
+            -monitor unix:"$HOME/garuda/monitor.sock",server,nowait
+            -no-reboot
+          )
 
-          # Inicia o QEMU com VNC local na porta TCP 5900.
-          # A senha é definida pelo monitor do QEMU.
-          nohup qemu-system-x86_64 \
-            -machine q35 \
-            -accel "$ACCEL" \
-            -cpu "$CPU_MODEL" \
-            -smp "$CPU_COUNT" \
-            -m "${RAM_MB}M" \
-            -drive file=garuda.qcow2,if=virtio,format=qcow2 \
-            -cdrom garuda.iso \
-            -boot order=d \
-            -vga std \
-            -device qemu-xhci \
-            -device usb-tablet \
-            -netdev user,id=net0 \
-            -device virtio-net-pci,netdev=net0 \
-            -vnc 127.0.0.1:0,password=on \
-            -monitor unix:"$HOME/garuda/monitor.sock",server,nowait \
+          if [ "$BOOT_MODE" = "installer" ]; then
+            QEMU_ARGS+=(-cdrom garuda.iso -boot order=d)
+          else
+            QEMU_ARGS+=(-boot order=c)
+          fi
+
+          echo "Modo: $BOOT_MODE"
+          echo "Vídeo virtual: Cirrus"
+          echo "RAM: ${RAM_MB} MB"
+          echo "CPUs: ${CPU_COUNT}"
+
+          nohup qemu-system-x86_64 "${QEMU_ARGS[@]}" \
             > "$HOME/garuda/qemu.log" 2>&1 &
 
           echo $! > "$HOME/garuda/qemu.pid"
@@ -138,53 +153,62 @@ jobs:
             if [ -S "$HOME/garuda/monitor.sock" ]; then
               break
             fi
+
             if ! kill -0 "$(cat "$HOME/garuda/qemu.pid")" 2>/dev/null; then
               cat "$HOME/garuda/qemu.log"
               exit 1
             fi
+
             sleep 2
           done
 
           if [ ! -S "$HOME/garuda/monitor.sock" ]; then
             cat "$HOME/garuda/qemu.log"
-            echo "ERRO: monitor do QEMU não iniciou."
             exit 1
           fi
 
-          # Define a senha VNC pelo monitor.
+          # Configura a senha do VNC pelo monitor do QEMU.
           python3 - "$VNC_PASS" "$HOME/garuda/monitor.sock" <<'PY'
           import socket, sys, time
 
           password, path = sys.argv[1], sys.argv[2]
           s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          s.settimeout(5)
           s.connect(path)
           time.sleep(1)
+
           try:
               s.recv(4096)
           except Exception:
               pass
+
           s.sendall(b"change vnc password\n")
           time.sleep(1)
+
           try:
               s.recv(4096)
           except Exception:
               pass
+
           s.sendall(password.encode("ascii") + b"\n")
           time.sleep(1)
+
+          try:
+              print(s.recv(4096).decode(errors="replace"))
+          except Exception:
+              pass
+
           s.close()
           PY
 
-          echo "QEMU iniciado. Verifique qemu.log se houver tela preta."
+          echo "VM iniciada. Consulte qemu.log se necessário."
 
-      - name: Abrir túnel TCP para bVNC
+      - name: Abrir túnel para bVNC
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$HOME/garuda"
 
-          # O túnel TCP permite que o aplicativo bVNC
-          # acesse a porta VNC do QEMU.
           nohup ssh -T \
             -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 \
@@ -210,30 +234,27 @@ jobs:
             sleep 2
           done
 
-          echo "========== DADOS DA CONEXÃO =========="
           cat "$HOME/garuda/tunnel.log"
-          echo "======================================"
-          echo "Use o endereço TCP e a porta indicados pelo túnel."
-          echo "Não use um link HTTP como endereço do servidor VNC."
+
+          if ! kill -0 "$(cat "$HOME/garuda/tunnel.pid")" 2>/dev/null; then
+            echo "ERRO: túnel não iniciou."
+            exit 1
+          fi
 
       - name: Manter sessão ativa
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          # O runner hospedado pelo GitHub tem limite de duração.
-          # Esta espera não aumenta o limite máximo do GitHub.
           while kill -0 "$(cat "$HOME/garuda/qemu.pid")" 2>/dev/null; do
-            if [ -f "$HOME/garuda/tunnel.pid" ] &&
-               ! kill -0 "$(cat "$HOME/garuda/tunnel.pid")" 2>/dev/null; then
-              echo "O túnel desconectou."
+            if ! kill -0 "$(cat "$HOME/garuda/tunnel.pid")" 2>/dev/null; then
+              echo "Túnel desconectado."
               break
             fi
-
-            sleep 30
+            sleep 20
           done
 
-      - name: Encerrar a máquina virtual
+      - name: Encerrar VM
         if: always()
         shell: bash
         run: |
@@ -242,15 +263,17 @@ jobs:
               socat - UNIX-CONNECT:"$HOME/garuda/monitor.sock" || true
           fi
 
-          if [ -f "$HOME/garuda/tunnel.pid" ]; then
-            kill "$(cat "$HOME/garuda/tunnel.pid")" 2>/dev/null || true
-          fi
-
           if [ -f "$HOME/garuda/qemu.pid" ]; then
             kill "$(cat "$HOME/garuda/qemu.pid")" 2>/dev/null || true
           fi
 
-      - name: Preparar checkpoint do disco
+          if [ -f "$HOME/garuda/tunnel.pid" ]; then
+            kill "$(cat "$HOME/garuda/tunnel.pid")" 2>/dev/null || true
+          fi
+
+          sleep 2
+
+      - name: Compactar checkpoint
         if: always()
         shell: bash
         run: |
@@ -259,25 +282,22 @@ jobs:
           DISK="$HOME/garuda/garuda.qcow2"
           SAVE="$HOME/garuda-save"
 
-          if [ ! -f "$DISK" ]; then
-            echo "Disco não encontrado; nada para salvar."
+          if [ ! -s "$DISK" ]; then
+            echo "Disco não encontrado."
             exit 0
           fi
 
           mkdir -p "$SAVE"
 
-          # Salva uma cópia compactada do disco virtual.
           zstd -T0 -1 -f "$DISK" \
             -o "$SAVE/garuda.qcow2.zst"
 
           SIZE=$(stat -c%s "$SAVE/garuda.qcow2.zst")
-          echo "Tamanho do checkpoint: $SIZE bytes"
+          echo "Checkpoint: $SIZE bytes"
 
-          # O cache do GitHub tem limites e não é armazenamento permanente.
           if [ "$SIZE" -gt 9800000000 ]; then
-            echo "Checkpoint excede o limite aproximado definido."
-            rm -f "$SAVE/garuda.qcow2.zst"
-            exit 0
+            echo "Checkpoint excede o limite configurado."
+            exit 1
           fi
 
           echo "SAVE_READY=true" >> "$GITHUB_ENV"
@@ -288,3 +308,4 @@ jobs:
         with:
           path: ~/garuda-save/garuda.qcow2.zst
           key: garuda-extnobrasil-${{ github.run_id }}-${{ github.run_attempt }}
+          
