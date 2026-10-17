@@ -1,4 +1,4 @@
-name: ExtNoBrasil PC Virtual - Garuda Separado
+name: ExtNoBrasil PC Virtual - Garuda GPU Virtual
 
 on:
   workflow_dispatch:
@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   pc-virtual:
-    name: Servidor do gabinete virtual
+    name: Servidor virtual ExtNoBrasil
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -50,7 +50,7 @@ jobs:
       VNC_PASSWORD: ${{ inputs.vnc_password }}
 
     steps:
-      - name: Preparar servidor e ferramentas
+      - name: Preparar servidor e QEMU
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -72,25 +72,22 @@ jobs:
           echo "=== EXT NOBRASIL PC VIRTUAL ==="
           echo "Servidor: GitHub Actions"
           echo "Virtualizador: QEMU"
-          echo "Sistema: Garuda Linux"
-          echo "GPU: adaptador virtual, sem GPU física dedicada"
-          echo "Disco virtual solicitado: $DISK_SIZE"
+          echo "GPU: VirtIO-GPU virtual"
+          echo "GPU física dedicada: não garantida"
+          echo "Disco solicitado: $DISK_SIZE"
 
-          echo
-          echo "=== RECURSOS DISPONÍVEIS ==="
+          echo "=== RECURSOS DO RUNNER ==="
           nproc
           free -h
           df -h "$VM_DIR"
 
           if [[ -w /dev/kvm ]]; then
-            echo "KVM acessível: sim"
+            echo "KVM disponível para uso."
           else
-            echo "KVM acessível: não confirmado"
+            echo "KVM não disponível; poderá ser usada emulação por software."
           fi
 
-      # O cache é uma tentativa de persistência, não um HD permanente.
-      - name: Restaurar checkpoint do sistema
-        id: restore
+      - name: Restaurar checkpoint
         uses: actions/cache/restore@v4
         with:
           path: pc-save/garuda.qcow2.zst
@@ -98,7 +95,7 @@ jobs:
           restore-keys: |
             garuda-extnobrasil-
 
-      - name: Recuperar ou criar o disco do sistema
+      - name: Criar ou recuperar disco do sistema
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -107,38 +104,48 @@ jobs:
           SAVED="$SAVE_DIR/garuda.qcow2.zst"
 
           if [[ -s "$SAVED" ]]; then
-            echo "Checkpoint encontrado. Descompactando..."
+            echo "Restaurando checkpoint..."
             zstd -d -T0 -f "$SAVED" -o "$DISK"
-          else
-            echo "Nenhum checkpoint restaurado."
           fi
 
           if [[ ! -s "$DISK" ]]; then
             echo "Criando disco virtual esparso de $DISK_SIZE..."
             qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
           else
-            echo "Disco existente encontrado."
+            echo "Disco existente:"
             qemu-img info "$DISK"
+
+            # Aumenta a capacidade virtual se foi solicitado um tamanho maior.
+            CURRENT_SIZE="$(qemu-img info --output=json "$DISK" |
+              python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])')"
+
+            case "$DISK_SIZE" in
+              80G)  REQUESTED=$((80 * 1024**3)) ;;
+              200G) REQUESTED=$((200 * 1024**3)) ;;
+              500G) REQUESTED=$((500 * 1024**3)) ;;
+              1T)   REQUESTED=$((1024**4)) ;;
+              *) echo "Tamanho inválido."; exit 1 ;;
+            esac
+
+            if (( REQUESTED > CURRENT_SIZE )); then
+              qemu-img resize "$DISK" "$DISK_SIZE"
+              echo "Capacidade virtual ampliada."
+            fi
           fi
 
           echo "DISK_PATH=$DISK" >> "$GITHUB_ENV"
 
-      - name: Baixar ISO do Garuda quando necessário
+      - name: Baixar ISO do Garuda
         if: ${{ inputs.boot_mode == 'installer' }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
           ISO="$VM_DIR/garuda.iso"
-
-          # URL da edição Dr460nized usada neste modelo.
-          # Se o projeto mover essa versão, atualize a URL.
           ISO_URL="https://sourceforge.net/projects/garuda-linux/files/garuda/dr460nized/260819/garuda-dr460nized-linux-garuda-260819.iso/download"
 
           if [[ ! -s "$ISO" ]]; then
-            echo "Iniciando download da ISO..."
-            echo "O tempo depende do espelho e da rede do runner."
-
+            echo "Baixando ISO. A velocidade depende do espelho disponível..."
             wget \
               --timeout=45 \
               --tries=3 \
@@ -147,62 +154,39 @@ jobs:
               "$ISO_URL"
           fi
 
-          if [[ ! -s "$ISO" ]]; then
-            echo "ERRO: a ISO não foi baixada."
+          test -s "$ISO" || {
+            echo "Erro: ISO não encontrada ou download incompleto."
             exit 1
-          fi
+          }
 
-          echo "ISO pronta:"
           ls -lh "$ISO"
           echo "ISO_PATH=$ISO" >> "$GITHUB_ENV"
 
-      - name: Configurar o servidor do gabinete
+      - name: Configurar recursos do servidor virtual
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          # A configuração é separada do arquivo do sistema operacional.
-          CPU_COUNT="$(nproc)"
-          VM_CPUS="$CPU_COUNT"
-
-          if (( VM_CPUS > 4 )); then
-            VM_CPUS=4
-          fi
-          if (( VM_CPUS < 1 )); then
-            VM_CPUS=1
-          fi
+          VM_CPUS="$(nproc)"
+          (( VM_CPUS > 4 )) && VM_CPUS=4
+          (( VM_CPUS < 1 )) && VM_CPUS=1
 
           MEM_MB="$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)"
           VM_RAM=$((MEM_MB - 2048))
 
-          if (( VM_RAM > 4096 )); then
-            VM_RAM=4096
-          fi
-          if (( VM_RAM > 6144 )); then
-            VM_RAM=6144
-          fi
-          if (( VM_RAM < 1024 )); then
-            VM_RAM=1024
-          fi
+          (( VM_RAM > 4096 )) && VM_RAM=4096
+          (( VM_RAM < 1024 )) && VM_RAM=1024
 
-          if [[ -w /dev/kvm ]]; then
-            ACCEL_ARGS=(-enable-kvm -cpu host)
-            echo "Aceleração KVM habilitada."
-          else
-            ACCEL_ARGS=(-accel tcg,thread=multi -cpu max)
-            echo "KVM indisponível; usando emulação por software."
-          fi
-
-          printf 'VM_CPUS=%s\n' "$VM_CPUS" >> "$GITHUB_ENV"
-          printf 'VM_RAM=%s\n' "$VM_RAM" >> "$GITHUB_ENV"
+          echo "VM_CPUS=$VM_CPUS" >> "$GITHUB_ENV"
+          echo "VM_RAM=$VM_RAM" >> "$GITHUB_ENV"
 
           echo "CPU virtual: $VM_CPUS"
           echo "RAM virtual: ${VM_RAM} MB"
-          echo "Disco: $DISK_SIZE"
-          echo "Gráficos: adaptador virtual QEMU"
-          echo "GPU física dedicada: não fornecida"
+          echo "GPU virtual: VirtIO-GPU"
+          echo "Aceleração 3D por hardware: não garantida"
+          echo "Armazenamento: capacidade virtual de $DISK_SIZE"
 
-      - name: Iniciar o PC virtual
+      - name: Iniciar PC virtual com VirtIO-GPU
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -210,7 +194,6 @@ jobs:
           DISK="$DISK_PATH"
           MONITOR="$VM_DIR/monitor.sock"
           LOG="$VM_DIR/qemu.log"
-          PIDFILE="$VM_DIR/qemu.pid"
 
           QEMU_ARGS=(
             -name "ExtNoBrasil-PC-Virtual"
@@ -218,7 +201,11 @@ jobs:
             -smp "$VM_CPUS"
             -m "$VM_RAM"
             -drive "file=$DISK,format=qcow2,if=virtio"
-            -vga virtio
+
+            # Adaptador gráfico virtual compatível com QEMU.
+            # Não representa uma NVIDIA RTX física.
+            -device virtio-vga
+
             -display none
             -device qemu-xhci,id=usb
             -device usb-tablet,bus=usb.0
@@ -238,7 +225,6 @@ jobs:
             QEMU_ARGS+=(-boot order=c)
           fi
 
-          # Tenta usar KVM; se não existir, usa emulação por software.
           if [[ -w /dev/kvm ]]; then
             qemu-system-x86_64 \
               -enable-kvm \
@@ -253,44 +239,38 @@ jobs:
               > "$LOG" 2>&1 &
           fi
 
-          echo "$!" > "$PIDFILE"
+          echo "$!" > "$VM_DIR/qemu.pid"
 
+          READY=0
           for i in $(seq 1 30); do
             if [[ -S "$MONITOR" ]]; then
+              READY=1
               break
             fi
 
-            if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
               cat "$LOG"
               echo "QEMU encerrou durante a inicialização."
               exit 1
             fi
-
             sleep 1
           done
 
-          if [[ ! -S "$MONITOR" ]]; then
+          if (( READY == 0 )); then
             cat "$LOG"
-            echo "O monitor QEMU não iniciou."
+            echo "Monitor QEMU não iniciou."
             exit 1
           fi
 
-          # Configura a senha VNC pelo monitor local.
+          # Define a senha do VNC pelo monitor do QEMU.
           python3 - "$MONITOR" "$VNC_PASSWORD" <<'PY'
-          import socket
-          import sys
-          import time
+          import socket, sys, time
 
           path, password = sys.argv[1], sys.argv[2]
-
-          if not (6 <= len(password) <= 8):
-              raise SystemExit("A senha precisa ter de 6 a 8 caracteres.")
-
-          if not password.isalnum():
-              raise SystemExit("Use somente letras e números na senha.")
+          if not 6 <= len(password) <= 8 or not password.isalnum():
+              raise SystemExit("Use de 6 a 8 letras ou números na senha.")
 
           s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
           for _ in range(30):
               try:
                   s.connect(path)
@@ -300,7 +280,7 @@ jobs:
           else:
               raise SystemExit("Não foi possível conectar ao monitor QEMU.")
 
-          s.settimeout(3)
+          s.settimeout(2)
           time.sleep(0.5)
           try:
               s.recv(4096)
@@ -316,30 +296,26 @@ jobs:
 
           s.sendall(password.encode("ascii") + b"\n")
           time.sleep(0.5)
-
           try:
-              response = s.recv(4096).decode("utf-8", "replace")
-              print(response)
+              print(s.recv(4096).decode("utf-8", "replace"))
           except OSError:
               pass
-
           s.close()
-          print("Comando de configuração da senha enviado.")
+          print("Solicitação de configuração da senha enviada.")
           PY
 
           echo "PC virtual iniciado."
           echo "VNC local: 127.0.0.1:5900"
-          echo "O acesso externo será exibido no próximo passo."
+          echo "GPU virtual configurada: VirtIO-GPU"
+          echo "Consulte o log do QEMU se houver falha gráfica."
 
-      - name: Abrir túnel TCP para o bVNC
+      - name: Criar túnel TCP para acesso remoto
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$VM_DIR"
           : > tunnel.log
 
-          # O túnel é externo ao GitHub. Sua disponibilidade não é garantida.
           ssh -T \
             -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 \
@@ -350,48 +326,35 @@ jobs:
             tcp@a.pinggy.io \
             > tunnel.log 2>&1 &
 
-          TUNNEL_PID=$!
-          echo "$TUNNEL_PID" > tunnel.pid
+          echo "$!" > tunnel.pid
 
-          echo "Aguardando o endereço TCP do túnel..."
-
-          FOUND=0
           for i in $(seq 1 60); do
             if grep -Eiq 'tcp://|[a-zA-Z0-9.-]+:[0-9]{4,5}' tunnel.log; then
-              FOUND=1
               break
             fi
-
-            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
               break
             fi
-
             sleep 2
           done
 
           cat tunnel.log
 
-          if (( FOUND == 0 )); then
-            echo "Não foi possível confirmar o endereço TCP."
-            echo "Consulte o log do túnel para verificar o erro."
+          if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
+            echo "O processo do túnel encerrou. Verifique o log."
             exit 1
           fi
 
-          echo
-          echo "=== DADOS PARA O bVNC ==="
-          echo "Servidor VNC interno: 127.0.0.1"
-          echo "Porta VNC interna: 5900"
-          echo "Use no bVNC o HOST e a PORTA EXTERNOS anunciados acima."
-          echo "Senha: a que você informou ao iniciar o workflow."
-          echo "Não use tcp:// como parte do campo de endereço."
+          echo "Use no bVNC o endereço e a porta TCP externos mostrados no log."
+          echo "Não use tcp:// no campo de endereço."
+          echo "Senha: a informada na execução do workflow."
 
       - name: Manter o PC virtual ligado
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          PIDFILE="$VM_DIR/qemu.pid"
-          PID="$(cat "$PIDFILE")"
+          PID="$(cat "$VM_DIR/qemu.pid")"
 
           echo "=== EXT NOBRASIL PC VIRTUAL [BETA] ==="
           echo "Criador - ExtNoBrasil (ExT)"
@@ -399,19 +362,18 @@ jobs:
           echo "Sistema: Garuda Linux"
           echo "CPU virtual: $VM_CPUS"
           echo "RAM virtual: ${VM_RAM} MB"
-          echo "Capacidade de disco: $DISK_SIZE"
-          echo "GPU: adaptador virtual, sem GPU física dedicada"
-          echo "A sessão dura enquanto o job e o túnel permanecerem ativos."
+          echo "Disco virtual solicitado: $DISK_SIZE"
+          echo "GPU: VirtIO-GPU virtual; sem RTX física garantida"
 
           while kill -0 "$PID" 2>/dev/null; do
             sleep 15
           done
 
-          echo "O processo QEMU terminou."
+          echo "QEMU encerrou."
           cat "$VM_DIR/qemu.log"
           exit 1
 
-      - name: Salvar checkpoint do disco
+      - name: Encerrar processos e compactar checkpoint
         if: ${{ always() }}
         shell: bash
         run: |
@@ -420,7 +382,6 @@ jobs:
           DISK="$VM_DIR/garuda.qcow2"
           OUT="$SAVE_DIR/garuda.qcow2.zst"
 
-          # Encerra os processos que ainda possam estar escrevendo no disco.
           if [[ -f "$VM_DIR/qemu.pid" ]]; then
             PID="$(cat "$VM_DIR/qemu.pid")"
             kill "$PID" 2>/dev/null
@@ -436,39 +397,37 @@ jobs:
           fi
 
           if [[ -s "$DISK" ]]; then
-            echo "Compactando o disco virtual para tentar salvar checkpoint..."
             mkdir -p "$SAVE_DIR"
+            echo "Compactando disco para tentar salvar checkpoint..."
 
             if zstd -T0 -3 -f "$DISK" -o "$OUT"; then
               SIZE="$(stat -c '%s' "$OUT")"
               echo "Tamanho compactado: $SIZE bytes"
 
-              # Limite conservador para evitar enviar um cache enorme.
-              if (( SIZE <= 9500000000 )); then
-                echo "Checkpoint compactado disponível."
-              else
-                echo "Checkpoint maior que o limite conservador."
+              if (( SIZE > 9500000000 )); then
+                echo "Checkpoint maior que o limite conservador; não será enviado."
                 rm -f "$OUT"
               fi
             else
-              echo "Falha ao compactar o disco."
+              echo "Não foi possível compactar o checkpoint."
               rm -f "$OUT"
             fi
           else
-            echo "Nenhum disco disponível para checkpoint."
+            echo "Disco não encontrado; nada para compactar."
           fi
 
-      - name: Publicar checkpoint no cache
+      - name: Salvar checkpoint no cache do GitHub
         if: ${{ always() }}
         uses: actions/cache/save@v4
         with:
           path: pc-save/garuda.qcow2.zst
           key: garuda-extnobrasil-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Resumo final
+      - name: Resumo
         if: ${{ always() }}
         shell: bash
         run: |
-          echo "ExtNoBrasil PC Virtual encerrado."
-          echo "O cache pode não ter sido salvo ou poderá ser removido."
-          echo "Para manter dados importantes, baixe backups para outro armazenamento."
+          echo "ExtNoBrasil PC Virtual finalizado."
+          echo "GPU virtual: VirtIO-GPU; aceleração 3D não garantida."
+          echo "Cache não é armazenamento permanente."
+          echo "Mantenha backups importantes fora do GitHub Actions."
