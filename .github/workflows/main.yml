@@ -1,433 +1,141 @@
-name: ExtNoBrasil PC Virtual - Garuda GPU Virtual
-
+name: PC Virtual
 on:
   workflow_dispatch:
     inputs:
-      vnc_password:
-        description: "Senha VNC (6 a 8 letras ou números)"
-        required: true
-        type: string
-
-      boot_mode:
-        description: "Inicialização do PC virtual"
-        required: true
-        type: choice
-        options:
-          - installer
-          - disk
-        default: installer
-
-      disk_size:
-        description: "Capacidade virtual do disco"
-        required: true
-        type: choice
-        options:
-          - 80G
-          - 200G
-          - 500G
-          - 1T
-        default: 80G
+      iso_url:
+        description: "URL da ISO (só na 1ª vez)"
+        default: ""
+      minutes:
+        description: "Minutos ligado (máx 340)"
+        default: "330"
 
 permissions:
   contents: read
-  actions: write
-
-concurrency:
-  group: extnobrasil-pc-virtual
-  cancel-in-progress: false
 
 jobs:
-  pc-virtual:
-    name: Servidor virtual ExtNoBrasil
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-
-    env:
-      VM_DIR: ${{ github.workspace }}/pc-virtual
-      SAVE_DIR: ${{ github.workspace }}/pc-save
-      DISK_SIZE: ${{ inputs.disk_size }}
-      BOOT_MODE: ${{ inputs.boot_mode }}
-      VNC_PASSWORD: ${{ inputs.vnc_password }}
-
+  pc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
-      - name: Preparar servidor e QEMU
-        shell: bash
+      - name: KVM
         run: |
-          set -Eeuo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            zstd \
-            socat \
-            curl \
-            wget \
-            openssh-client \
-            python3 \
-            ca-certificates
+      - name: Dependências
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 qemu-utils novnc websockify
+          curl -sL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
 
-          mkdir -p "$VM_DIR" "$SAVE_DIR"
-
-          echo "=== EXT NOBRASIL PC VIRTUAL ==="
-          echo "Servidor: GitHub Actions"
-          echo "Virtualizador: QEMU"
-          echo "GPU: VirtIO-GPU virtual"
-          echo "GPU física dedicada: não garantida"
-          echo "Disco solicitado: $DISK_SIZE"
-
-          echo "=== RECURSOS DO RUNNER ==="
-          nproc
-          free -h
-          df -h "$VM_DIR"
-
-          if [[ -w /dev/kvm ]]; then
-            echo "KVM disponível para uso."
-          else
-            echo "KVM não disponível; poderá ser usada emulação por software."
-          fi
-
-      - name: Restaurar checkpoint
+      - name: Restaurar disco
         uses: actions/cache/restore@v4
         with:
-          path: pc-save/garuda.qcow2.zst
-          key: garuda-extnobrasil-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            garuda-extnobrasil-
+          path: disk.qcow2
+          key: pcdisk-${{ github.run_id }}
+          restore-keys: pcdisk-
 
-      - name: Criar ou recuperar disco do sistema
-        shell: bash
+      - name: Compilar launcher Rust
         run: |
-          set -Eeuo pipefail
+          cat > pc.rs <<'EOF'
+          use std::{env, io::{BufRead, BufReader, Write}, path::Path, process::{Command, Stdio}, thread, time::{Duration, Instant}};
 
-          DISK="$VM_DIR/garuda.qcow2"
-          SAVED="$SAVE_DIR/garuda.qcow2.zst"
-
-          if [[ -s "$SAVED" ]]; then
-            echo "Restaurando checkpoint..."
-            zstd -d -T0 -f "$SAVED" -o "$DISK"
-          fi
-
-          if [[ ! -s "$DISK" ]]; then
-            echo "Criando disco virtual esparso de $DISK_SIZE..."
-            qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
-          else
-            echo "Disco existente:"
-            qemu-img info "$DISK"
-
-            # Aumenta a capacidade virtual se foi solicitado um tamanho maior.
-            CURRENT_SIZE="$(qemu-img info --output=json "$DISK" |
-              python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])')"
-
-            case "$DISK_SIZE" in
-              80G)  REQUESTED=$((80 * 1024**3)) ;;
-              200G) REQUESTED=$((200 * 1024**3)) ;;
-              500G) REQUESTED=$((500 * 1024**3)) ;;
-              1T)   REQUESTED=$((1024**4)) ;;
-              *) echo "Tamanho inválido."; exit 1 ;;
-            esac
-
-            if (( REQUESTED > CURRENT_SIZE )); then
-              qemu-img resize "$DISK" "$DISK_SIZE"
-              echo "Capacidade virtual ampliada."
-            fi
-          fi
-
-          echo "DISK_PATH=$DISK" >> "$GITHUB_ENV"
-
-      - name: Baixar ISO do Garuda
-        if: ${{ inputs.boot_mode == 'installer' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          ISO="$VM_DIR/garuda.iso"
-          ISO_URL="https://sourceforge.net/projects/garuda-linux/files/garuda/dr460nized/260819/garuda-dr460nized-linux-garuda-260819.iso/download"
-
-          if [[ ! -s "$ISO" ]]; then
-            echo "Baixando ISO. A velocidade depende do espelho disponível..."
-            wget \
-              --timeout=45 \
-              --tries=3 \
-              --progress=dot:giga \
-              -O "$ISO" \
-              "$ISO_URL"
-          fi
-
-          test -s "$ISO" || {
-            echo "Erro: ISO não encontrada ou download incompleto."
-            exit 1
+          fn sh(c: &str, a: &[&str]) -> bool {
+              Command::new(c).args(a).status().map(|s| s.success()).unwrap_or(false)
+          }
+          fn var(k: &str, d: &str) -> String {
+              env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string())
           }
 
-          ls -lh "$ISO"
-          echo "ISO_PATH=$ISO" >> "$GITHUB_ENV"
+          fn main() {
+              let iso_url = var("ISO_URL", "");
+              let ram = var("RAM", "6144");
+              let cpus = var("CPUS", "4");
+              let minutes: u64 = var("MINUTES", "330").parse().unwrap_or(330);
+              let pass = var("VNC_PASS", "");
+              let disk = "disk.qcow2";
 
-      - name: Configurar recursos do servidor virtual
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+              let first = !Path::new(disk).exists();
+              if first {
+                  sh("qemu-img", &["create", "-f", "qcow2", "-o", "lazy_refcounts=on", disk, "40G"]);
+                  if !iso_url.is_empty() {
+                      sh("curl", &["-L", "--fail", "-o", "os.iso", &iso_url]);
+                  }
+              }
 
-          VM_CPUS="$(nproc)"
-          (( VM_CPUS > 4 )) && VM_CPUS=4
-          (( VM_CPUS < 1 )) && VM_CPUS=1
+              let mut args: Vec<String> = vec![
+                  "-enable-kvm", "-cpu", "host", "-smp", &cpus, "-m", &ram,
+                  "-drive", &format!("file={},if=virtio,cache=unsafe,aio=threads,discard=unmap", disk),
+                  "-vga", "virtio", "-vnc", "127.0.0.1:1,password=on",
+                  "-device", "virtio-net-pci,netdev=n0", "-netdev", "user,id=n0",
+                  "-device", "qemu-xhci", "-device", "usb-tablet",
+                  "-display", "none", "-monitor", "stdio",
+              ].into_iter().map(String::from).collect();
+              if first && Path::new("os.iso").exists() {
+                  args.extend(["-cdrom", "os.iso", "-boot", "order=dc"].map(String::from));
+              }
 
-          MEM_MB="$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)"
-          VM_RAM=$((MEM_MB - 2048))
+              let mut qemu = Command::new("qemu-system-x86_64")
+                  .args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+                  .spawn().expect("qemu falhou");
+              let mut mon = qemu.stdin.take().unwrap();
+              thread::sleep(Duration::from_secs(2));
+              if !pass.is_empty() {
+                  let _ = writeln!(mon, "set_password vnc {}", pass);
+              }
 
-          (( VM_RAM > 4096 )) && VM_RAM=4096
-          (( VM_RAM < 1024 )) && VM_RAM=1024
+              let _ws = Command::new("websockify")
+                  .args(["--web", "/usr/share/novnc", "6080", "127.0.0.1:5901"])
+                  .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("websockify falhou");
 
-          echo "VM_CPUS=$VM_CPUS" >> "$GITHUB_ENV"
-          echo "VM_RAM=$VM_RAM" >> "$GITHUB_ENV"
+              let mut cf = Command::new("./cloudflared")
+                  .args(["tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:6080"])
+                  .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("cloudflared falhou");
+              let err = cf.stderr.take().unwrap();
+              thread::spawn(move || {
+                  for l in BufReader::new(err).lines().flatten() {
+                      if let Some(i) = l.find("https://") {
+                          let u = l[i..].split_whitespace().next().unwrap_or("");
+                          if u.contains("trycloudflare.com") {
+                              println!("\n>>> ACESSE: {}/vnc.html\n", u);
+                              if let Ok(p) = env::var("GITHUB_STEP_SUMMARY") {
+                                  let _ = std::fs::write(p, format!("### PC Virtual\n{}/vnc.html\n", u));
+                              }
+                          }
+                      }
+                  }
+              });
 
-          echo "CPU virtual: $VM_CPUS"
-          echo "RAM virtual: ${VM_RAM} MB"
-          echo "GPU virtual: VirtIO-GPU"
-          echo "Aceleração 3D por hardware: não garantida"
-          echo "Armazenamento: capacidade virtual de $DISK_SIZE"
+              let fim = Instant::now() + Duration::from_secs(minutes * 60);
+              while Instant::now() < fim {
+                  if let Ok(Some(_)) = qemu.try_wait() { break; }
+                  thread::sleep(Duration::from_secs(5));
+              }
 
-      - name: Iniciar PC virtual com VirtIO-GPU
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+              // desligamento limpo pra não corromper o disco
+              let _ = writeln!(mon, "system_powerdown");
+              for _ in 0..30 {
+                  if let Ok(Some(_)) = qemu.try_wait() { return; }
+                  thread::sleep(Duration::from_secs(2));
+              }
+              let _ = writeln!(mon, "quit");
+              let _ = qemu.wait();
+          }
+          EOF
+          rustc -C opt-level=3 -C panic=abort -C strip=symbols pc.rs -o pc
 
-          DISK="$DISK_PATH"
-          MONITOR="$VM_DIR/monitor.sock"
-          LOG="$VM_DIR/qemu.log"
+      - name: Rodar PC
+        env:
+          ISO_URL: ${{ inputs.iso_url }}
+          MINUTES: ${{ inputs.minutes }}
+          VNC_PASS: ${{ secrets.VNC_PASS }}
+        run: ./pc
 
-          QEMU_ARGS=(
-            -name "ExtNoBrasil-PC-Virtual"
-            -machine q35
-            -smp "$VM_CPUS"
-            -m "$VM_RAM"
-            -drive "file=$DISK,format=qcow2,if=virtio"
-
-            # Adaptador gráfico virtual compatível com QEMU.
-            # Não representa uma NVIDIA RTX física.
-            -device virtio-vga
-
-            -display none
-            -device qemu-xhci,id=usb
-            -device usb-tablet,bus=usb.0
-            -netdev user,id=net0
-            -device e1000,netdev=net0
-            -vnc 127.0.0.1:0,password=on
-            -monitor "unix:$MONITOR,server=on,wait=off"
-            -no-reboot
-          )
-
-          if [[ "$BOOT_MODE" == "installer" ]]; then
-            QEMU_ARGS+=(
-              -cdrom "$ISO_PATH"
-              -boot order=d,menu=on
-            )
-          else
-            QEMU_ARGS+=(-boot order=c)
-          fi
-
-          if [[ -w /dev/kvm ]]; then
-            qemu-system-x86_64 \
-              -enable-kvm \
-              -cpu host \
-              "${QEMU_ARGS[@]}" \
-              > "$LOG" 2>&1 &
-          else
-            qemu-system-x86_64 \
-              -accel tcg,thread=multi \
-              -cpu max \
-              "${QEMU_ARGS[@]}" \
-              > "$LOG" 2>&1 &
-          fi
-
-          echo "$!" > "$VM_DIR/qemu.pid"
-
-          READY=0
-          for i in $(seq 1 30); do
-            if [[ -S "$MONITOR" ]]; then
-              READY=1
-              break
-            fi
-
-            if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
-              cat "$LOG"
-              echo "QEMU encerrou durante a inicialização."
-              exit 1
-            fi
-            sleep 1
-          done
-
-          if (( READY == 0 )); then
-            cat "$LOG"
-            echo "Monitor QEMU não iniciou."
-            exit 1
-          fi
-
-          # Define a senha do VNC pelo monitor do QEMU.
-          python3 - "$MONITOR" "$VNC_PASSWORD" <<'PY'
-          import socket, sys, time
-
-          path, password = sys.argv[1], sys.argv[2]
-          if not 6 <= len(password) <= 8 or not password.isalnum():
-              raise SystemExit("Use de 6 a 8 letras ou números na senha.")
-
-          s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-          for _ in range(30):
-              try:
-                  s.connect(path)
-                  break
-              except OSError:
-                  time.sleep(1)
-          else:
-              raise SystemExit("Não foi possível conectar ao monitor QEMU.")
-
-          s.settimeout(2)
-          time.sleep(0.5)
-          try:
-              s.recv(4096)
-          except OSError:
-              pass
-
-          s.sendall(b"change vnc password\n")
-          time.sleep(0.3)
-          try:
-              s.recv(4096)
-          except OSError:
-              pass
-
-          s.sendall(password.encode("ascii") + b"\n")
-          time.sleep(0.5)
-          try:
-              print(s.recv(4096).decode("utf-8", "replace"))
-          except OSError:
-              pass
-          s.close()
-          print("Solicitação de configuração da senha enviada.")
-          PY
-
-          echo "PC virtual iniciado."
-          echo "VNC local: 127.0.0.1:5900"
-          echo "GPU virtual configurada: VirtIO-GPU"
-          echo "Consulte o log do QEMU se houver falha gráfica."
-
-      - name: Criar túnel TCP para acesso remoto
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$VM_DIR"
-          : > tunnel.log
-
-          ssh -T \
-            -o StrictHostKeyChecking=no \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=3 \
-            -o ExitOnForwardFailure=yes \
-            -p 443 \
-            -R 0:127.0.0.1:5900 \
-            tcp@a.pinggy.io \
-            > tunnel.log 2>&1 &
-
-          echo "$!" > tunnel.pid
-
-          for i in $(seq 1 60); do
-            if grep -Eiq 'tcp://|[a-zA-Z0-9.-]+:[0-9]{4,5}' tunnel.log; then
-              break
-            fi
-            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
-              break
-            fi
-            sleep 2
-          done
-
-          cat tunnel.log
-
-          if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
-            echo "O processo do túnel encerrou. Verifique o log."
-            exit 1
-          fi
-
-          echo "Use no bVNC o endereço e a porta TCP externos mostrados no log."
-          echo "Não use tcp:// no campo de endereço."
-          echo "Senha: a informada na execução do workflow."
-
-      - name: Manter o PC virtual ligado
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          PID="$(cat "$VM_DIR/qemu.pid")"
-
-          echo "=== EXT NOBRASIL PC VIRTUAL [BETA] ==="
-          echo "Criador - ExtNoBrasil (ExT)"
-          echo "Perfil do Discord - Brasil_kill0"
-          echo "Sistema: Garuda Linux"
-          echo "CPU virtual: $VM_CPUS"
-          echo "RAM virtual: ${VM_RAM} MB"
-          echo "Disco virtual solicitado: $DISK_SIZE"
-          echo "GPU: VirtIO-GPU virtual; sem RTX física garantida"
-
-          while kill -0 "$PID" 2>/dev/null; do
-            sleep 15
-          done
-
-          echo "QEMU encerrou."
-          cat "$VM_DIR/qemu.log"
-          exit 1
-
-      - name: Encerrar processos e compactar checkpoint
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set +e
-
-          DISK="$VM_DIR/garuda.qcow2"
-          OUT="$SAVE_DIR/garuda.qcow2.zst"
-
-          if [[ -f "$VM_DIR/qemu.pid" ]]; then
-            PID="$(cat "$VM_DIR/qemu.pid")"
-            kill "$PID" 2>/dev/null
-            for i in $(seq 1 10); do
-              kill -0 "$PID" 2>/dev/null || break
-              sleep 1
-            done
-            kill -9 "$PID" 2>/dev/null
-          fi
-
-          if [[ -f "$VM_DIR/tunnel.pid" ]]; then
-            kill "$(cat "$VM_DIR/tunnel.pid")" 2>/dev/null
-          fi
-
-          if [[ -s "$DISK" ]]; then
-            mkdir -p "$SAVE_DIR"
-            echo "Compactando disco para tentar salvar checkpoint..."
-
-            if zstd -T0 -3 -f "$DISK" -o "$OUT"; then
-              SIZE="$(stat -c '%s' "$OUT")"
-              echo "Tamanho compactado: $SIZE bytes"
-
-              if (( SIZE > 9500000000 )); then
-                echo "Checkpoint maior que o limite conservador; não será enviado."
-                rm -f "$OUT"
-              fi
-            else
-              echo "Não foi possível compactar o checkpoint."
-              rm -f "$OUT"
-            fi
-          else
-            echo "Disco não encontrado; nada para compactar."
-          fi
-
-      - name: Salvar checkpoint no cache do GitHub
-        if: ${{ always() }}
+      - name: Salvar disco
+        if: always()
         uses: actions/cache/save@v4
         with:
-          path: pc-save/garuda.qcow2.zst
-          key: garuda-extnobrasil-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Resumo
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          echo "ExtNoBrasil PC Virtual finalizado."
-          echo "GPU virtual: VirtIO-GPU; aceleração 3D não garantida."
-          echo "Cache não é armazenamento permanente."
-          echo "Mantenha backups importantes fora do GitHub Actions."
+          path: disk.qcow2
+          key: pcdisk-${{ github.run_id }}
